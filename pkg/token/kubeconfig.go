@@ -1,100 +1,103 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package token
 
 import (
 	"bytes"
-	"encoding/base64"
+	"context"
 	"fmt"
-	"html/template"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"time"
 
-	config "github.com/k0sproject/k0s/pkg/apis/v1beta1"
-	"github.com/k0sproject/k0s/pkg/constant"
+	"github.com/k0sproject/k0s/pkg/apis/k0s/v1beta1"
+	"github.com/k0sproject/k0s/pkg/config"
+
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	bootstraptokenv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/bootstraptoken/v1"
 )
 
 const (
-	controllerRole = "controller"
-	workerRole     = "worker"
+	RoleController = "controller"
+	RoleWorker     = "worker"
 )
 
-var (
-	kubeconfigTemplate = template.Must(template.New("kubeconfig").Parse(`
-apiVersion: v1
-clusters:
-- cluster:
-    server: {{.JoinURL}}
-    certificate-authority-data: {{.CACert}}
-  name: k0s
-contexts:
-- context:
-    cluster: k0s
-    user: {{.User}}
-  name: k0s
-current-context: k0s
-kind: Config
-preferences: {}
-users:
-- name: {{.User}}
-  user:
-    token: {{.Token}}
-`))
+const (
+	ControllerTokenAuthName = "controller-bootstrap"
+	WorkerTokenAuthName     = "kubelet-bootstrap"
 )
 
-func CreateKubeletBootstrapConfig(clusterConfig *config.ClusterConfig, k0sVars constant.CfgVars, role string, expiry time.Duration) (string, error) {
+// CreateKubeletBootstrapToken creates a new k0s bootstrap token.
+func CreateKubeletBootstrapToken(ctx context.Context, api *v1beta1.APISpec, k0sVars *config.CfgVars, role string, expiry time.Duration) (string, error) {
+	userName, joinURL, err := loadUserAndJoinURL(api, role)
+	if err != nil {
+		return "", err
+	}
+
+	caCert, err := loadCACert(k0sVars)
+	if err != nil {
+		return "", err
+	}
+
+	token, err := loadToken(ctx, k0sVars, role, expiry)
+	if err != nil {
+		return "", err
+	}
+
+	kubeconfig, err := GenerateKubeconfig(joinURL, caCert, userName, token)
+	if err != nil {
+		return "", err
+	}
+
+	return JoinEncode(bytes.NewReader(kubeconfig))
+}
+
+func GenerateKubeconfig(joinURL string, caCert []byte, userName string, token *bootstraptokenv1.BootstrapTokenString) ([]byte, error) {
+	const k0sContextName = "k0s"
+	kubeconfig, err := clientcmd.Write(clientcmdapi.Config{
+		Clusters: map[string]*clientcmdapi.Cluster{k0sContextName: {
+			Server:                   joinURL,
+			CertificateAuthorityData: caCert,
+		}},
+		Contexts: map[string]*clientcmdapi.Context{k0sContextName: {
+			Cluster:  k0sContextName,
+			AuthInfo: userName,
+		}},
+		CurrentContext: k0sContextName,
+		AuthInfos: map[string]*clientcmdapi.AuthInfo{userName: {
+			Token: token.String(),
+		}},
+	})
+	return kubeconfig, err
+}
+
+func loadUserAndJoinURL(api *v1beta1.APISpec, role string) (string, string, error) {
+	switch role {
+	case RoleController:
+		return ControllerTokenAuthName, api.K0sControlPlaneAPIAddress(), nil
+	case RoleWorker:
+		return WorkerTokenAuthName, api.APIAddressURL(), nil
+	default:
+		return "", "", fmt.Errorf("unsupported role %q; supported roles are %q and %q", role, RoleController, RoleWorker)
+	}
+}
+
+func loadCACert(k0sVars *config.CfgVars) ([]byte, error) {
 	crtFile := filepath.Join(k0sVars.CertRootDir, "ca.crt")
-	caCert, err := ioutil.ReadFile(crtFile)
+	caCert, err := os.ReadFile(crtFile)
 	if err != nil {
-		return "", fmt.Errorf("failed to read cluster ca certificate from %s: %w. check if the control plane is initialized on this node", crtFile, err)
-	}
-	manager, err := NewManager(filepath.Join(k0sVars.AdminKubeConfigPath))
-	if err != nil {
-		return "", err
-	}
-	tokenString, err := manager.Create(expiry, role)
-	if err != nil {
-		return "", err
-	}
-	data := struct {
-		CACert  string
-		Token   string
-		User    string
-		JoinURL string
-		APIUrl  string
-	}{
-		CACert: base64.StdEncoding.EncodeToString(caCert),
-		Token:  tokenString,
-	}
-	if role == workerRole {
-		data.User = "kubelet-bootstrap"
-		data.JoinURL = clusterConfig.Spec.API.APIAddressURL()
-	} else if role == controllerRole {
-		data.User = "controller-bootstrap"
-		data.JoinURL = clusterConfig.Spec.API.K0sControlPlaneAPIAddress()
-	} else {
-		return "", fmt.Errorf("unsupported role %s only supported roles are %q and %q", role, controllerRole, workerRole)
+		return nil, fmt.Errorf("failed to read cluster CA from %q: %w; check if the control plane is initialized on this node", crtFile, err)
 	}
 
-	var buf bytes.Buffer
+	return caCert, nil
+}
 
-	err = kubeconfigTemplate.Execute(&buf, &data)
+func loadToken(ctx context.Context, k0sVars *config.CfgVars, role string, expiry time.Duration) (*bootstraptokenv1.BootstrapTokenString, error) {
+	manager, err := NewManager(k0sVars.AdminKubeConfigPath)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return JoinEncode(&buf)
+	return manager.Create(ctx, expiry, role)
 }

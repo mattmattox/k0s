@@ -1,36 +1,37 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2020 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package supervisor
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"os/exec"
-	"path"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/k0sproject/k0s/internal/util"
+	"github.com/k0sproject/k0s/internal/pkg/dir"
+	"github.com/k0sproject/k0s/internal/pkg/log"
 	"github.com/k0sproject/k0s/pkg/constant"
 )
+
+// RequiredPrivileges encodes the intent of required privileges for a supervised process
+// in a platform-agnostic way. Platform-specific implementations translate these into
+// the appropriate mechanisms (e.g., ambient capabilities on Linux).
+type RequiredPrivileges struct {
+	// BindsPrivilegedPorts indicates that the process needs to bind to ports < 1024
+	BindsPrivilegedPorts bool
+}
 
 // Supervisor is dead simple and stupid process supervisor, just tries to keep the process running in a while-true loop
 type Supervisor struct {
@@ -38,67 +39,176 @@ type Supervisor struct {
 	BinPath        string
 	RunDir         string
 	DataDir        string
+	Stdin          func() io.Reader
 	Args           []string
 	PidFile        string
 	UID            int
 	GID            int
 	TimeoutStop    time.Duration
 	TimeoutRespawn time.Duration
+	// For those components having env prefix convention such as ETCD_xxx, we should keep the prefix.
+	KeepEnvPrefix bool
+	// A function to clean some leftovers before starting or restarting the supervised process
+	CleanBeforeFn func() error
+	// Required privileges for the supervised process
+	RequiredPrivileges RequiredPrivileges
 
-	cmd  *exec.Cmd
-	quit chan bool
-	done chan bool
-	log  *logrus.Entry
+	cmd            *exec.Cmd
+	log            logrus.FieldLogger
+	mutex          sync.Mutex
+	startStopMutex sync.Mutex
+	stop           func(opts StopOpts)
 }
+
+const k0sManaged = "_K0S_MANAGED=yes"
 
 // processWaitQuit waits for a process to exit or a shut down signal
 // returns true if shutdown is requested
-func (s *Supervisor) processWaitQuit() bool {
-	waitresult := make(chan error)
+func (s *Supervisor) processWaitQuit(ctx context.Context, cmd *exec.Cmd) bool {
+	waitresult := make(chan error, 1)
 	go func() {
-		waitresult <- s.cmd.Wait()
+		defer close(waitresult)
+		err := cmd.Wait()
+		defer func() { waitresult <- err }()
+		if err := os.Remove(s.PidFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.log.WithError(err).Error("Failed to remove PID file")
+		}
 	}()
 
-	pidbuf := []byte(strconv.Itoa(s.cmd.Process.Pid) + "\n")
-	err := ioutil.WriteFile(s.PidFile, pidbuf, constant.PidFileMode)
-	if err != nil {
-		s.log.Warnf("Failed to write file %s: %v", s.PidFile, err)
-	}
-	defer os.Remove(s.PidFile)
-
 	select {
-	case <-s.quit:
-		for {
-			s.log.Infof("Shutting down pid %d", s.cmd.Process.Pid)
-			err := s.cmd.Process.Signal(syscall.SIGTERM)
-			if err != nil {
-				s.log.Warnf("Failed to send SIGTERM to pid %d: %s", s.cmd.Process.Pid, err)
-			}
-			select {
-			case <-time.After(s.TimeoutStop):
-				continue
-			case <-waitresult:
-				return true
-			}
+	case <-ctx.Done():
+		cause := context.Cause(ctx)
+		s.log.Debugf("Attempting to terminate supervised process (%v)", cause)
+		var stopOpts StopOpts
+		if stoppingErr, ok := errors.AsType[*stoppingErr](cause); ok {
+			stopOpts = stoppingErr.opts
 		}
-	case err := <-waitresult:
-		if err != nil {
-			s.log.Warn(err)
+		if err := s.terminateSupervisedProcess(cmd, waitresult, stopOpts); err != nil {
+			s.log.WithError(err).Error("Error while terminating process")
 		} else {
-			s.log.Warnf("Process exited with code: %d", s.cmd.ProcessState.ExitCode())
+			s.log.Info("Process terminated successfully")
 		}
+		return true
+
+	case err, ok := <-waitresult:
+		var exitErr *exec.ExitError
+		state := cmd.ProcessState
+		switch {
+		case !ok:
+			s.log.Error("Failed to wait for process: ", state)
+		case errors.As(err, &exitErr):
+			state = exitErr.ProcessState
+			fallthrough
+		case err == nil:
+			s.log.Error("Process terminated unexpectedly: ", state)
+		default:
+			s.log.WithError(err).Error("Failed to wait for process: ", state)
+		}
+		return false
 	}
-	return false
 }
 
-// Supervise Starts supervising the given process
-func (s *Supervisor) Supervise() error {
-	s.log = logrus.WithField("component", s.Name)
-	s.PidFile = path.Join(s.RunDir, s.Name) + ".pid"
-	if err := util.InitDirectory(s.RunDir, constant.RunDirMode); err != nil {
-		s.log.Warnf("failed to initialize dir: %v", err)
-		return err
+func (s *Supervisor) terminateSupervisedProcess(cmd *exec.Cmd, waitresult <-chan error, stopOpts StopOpts) error {
+	if timeout := stopOpts.DeferGracefulTerminationUntil; timeout != nil {
+		// Termination request deferred, wait for process to finish on its own.
+		s.log.Debug("Awaiting process termination")
+
+		select {
+		case err := <-waitresult:
+			var exitErr *exec.ExitError
+			switch {
+			case err == nil:
+				return nil
+			case errors.As(err, &exitErr):
+				return exitErr
+			default:
+				return fmt.Errorf("failed to wait for process: %w", err)
+			}
+		case <-timeout:
+			s.log.Debug("Timed out while waiting for process to terminate, requesting graceful termination")
+		}
 	}
+
+	err := requestGracefulTermination(cmd.Process)
+	switch {
+	case err == nil:
+		// Termination request sent, wait for process to finish.
+		s.log.Debug("Awaiting graceful process termination for ", s.TimeoutStop)
+
+		select {
+		case err := <-waitresult:
+			var exitErr *exec.ExitError
+			switch {
+			case err == nil:
+				return nil
+			case errors.As(err, &exitErr):
+				if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signal() == syscall.SIGTERM {
+					return errors.New("process terminated without handling SIGTERM")
+				}
+				return exitErr
+			default:
+				return fmt.Errorf("failed to wait for process: %w", err)
+			}
+
+		case <-time.After(s.TimeoutStop):
+			err = fmt.Errorf("timed out after %s while waiting for process to terminate", s.TimeoutStop)
+		}
+
+		return err
+
+	case errors.Is(err, os.ErrProcessDone):
+		// The process has finished even before the termination could be requested.
+		select {
+		case err = <-waitresult:
+			var exitErr *exec.ExitError
+			state := cmd.ProcessState
+			switch {
+			case errors.As(err, &exitErr):
+				state = exitErr.ProcessState
+				fallthrough
+			case err == nil:
+				err = errors.New(state.String())
+			default:
+				return fmt.Errorf("failed to wait for process: %s (%w)", state, err)
+			}
+		default:
+			err = errors.New("process state unavailable")
+		}
+
+		return fmt.Errorf("process terminated before graceful termination could be requested: %w", err)
+
+	default:
+		// Something else went wrong
+		return fmt.Errorf("failed to request graceful termination: %w", err)
+	}
+}
+
+// Controls how supervised processes are stopped.
+type StopOpts struct {
+	// Delays sending a graceful termination request to the supervised process
+	// until the channel is closed.
+	//
+	// This is useful when the process is expected to terminate on its own and
+	// an immediate termination request would be premature. Once the channel is
+	// closed, the supervisor reverts to the standard graceful termination
+	// process.
+	DeferGracefulTerminationUntil <-chan struct{}
+}
+
+type stoppingErr struct{ opts StopOpts }
+
+func (*stoppingErr) Error() string { return "supervisor is stopping" }
+
+// Supervise Starts supervising the given process
+func (s *Supervisor) Supervise(ctx context.Context) error {
+	s.startStopMutex.Lock()
+	defer s.startStopMutex.Unlock()
+	// check if it is already started
+	if s.stop != nil {
+		return errors.New("already started")
+	}
+	s.log = logrus.WithField("component", s.Name)
+	s.PidFile = filepath.Join(s.RunDir, s.Name) + ".pid"
 
 	if s.TimeoutStop == 0 {
 		s.TimeoutStop = 5 * time.Second
@@ -107,41 +217,69 @@ func (s *Supervisor) Supervise() error {
 		s.TimeoutRespawn = 5 * time.Second
 	}
 
-	started := make(chan error)
+	if err := s.maybeCleanupPIDFile(ctx); err != nil {
+		if !errors.Is(err, errors.ErrUnsupported) {
+			return err
+		}
+
+		s.log.WithError(err).Warn("Old process cannot be terminated")
+	}
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	started, done := make(chan error, 1), make(chan bool)
+
 	go func() {
+		defer close(done)
+
 		s.log.Info("Starting to supervise")
+		restarts := 0
 		for {
-			s.cmd = exec.Command(s.BinPath, s.Args...)
-			s.cmd.Dir = s.DataDir
-			s.cmd.Env = getEnv(s.DataDir)
+			s.mutex.Lock()
 
-			// detach from the process group so children don't
-			// get signals sent directly to parent.
-			s.cmd.SysProcAttr = DetachAttr(s.UID, s.GID)
+			var err error
+			if s.CleanBeforeFn != nil {
+				err = s.CleanBeforeFn()
+			}
+			if err != nil {
+				s.log.Warnf("Failed to clean before running the process %s: %s", s.BinPath, err)
+			} else {
+				s.cmd = exec.Command(s.BinPath, s.Args...)
+				s.cmd.Dir = s.DataDir
+				s.cmd.Env = getEnv(s.DataDir, s.Name, s.KeepEnvPrefix)
+				if s.Stdin != nil {
+					s.cmd.Stdin = s.Stdin()
+				}
 
-			s.cmd.Stdout = s.log.Writer()
-			s.cmd.Stderr = s.log.Writer()
+				// detach from the process group so children don't
+				// get signals sent directly to parent.
+				s.cmd.SysProcAttr = DetachAttr(s.UID, s.GID, s.RequiredPrivileges)
 
-			err := s.cmd.Start()
+				const maxLogChunkLen = 16 * 1024
+				s.cmd.Stdout = log.NewWriter(s.log.WithField("stream", "stdout"), logrus.InfoLevel, maxLogChunkLen)
+				s.cmd.Stderr = log.NewWriter(s.log.WithField("stream", "stderr"), logrus.InfoLevel, maxLogChunkLen)
+
+				err = s.cmd.Start()
+			}
+			s.mutex.Unlock()
 			if err != nil {
 				s.log.Warnf("Failed to start: %s", err)
-				if s.quit == nil {
+				if restarts == 0 {
 					started <- err
 					return
 				}
 			} else {
-				if s.quit == nil {
-					s.log.Info("Started successfully, go nuts")
-					s.quit = make(chan bool)
-					s.done = make(chan bool)
-					defer func() {
-						s.done <- true
-					}()
+				err := os.WriteFile(s.PidFile, []byte(strconv.Itoa(s.cmd.Process.Pid)+"\n"), constant.PidFileMode)
+				if err != nil {
+					s.log.Warnf("Failed to write file %s: %v", s.PidFile, err)
+				}
+				if restarts == 0 {
+					s.log.Infof("Started successfully, go nuts pid %d", s.cmd.Process.Pid)
 					started <- nil
 				} else {
-					s.log.Info("Restarted")
+					s.log.Infof("Restarted (%d)", restarts)
 				}
-				if s.processWaitQuit() {
+				restarts++
+				if s.processWaitQuit(ctx, s.cmd) {
 					return
 				}
 			}
@@ -150,33 +288,122 @@ func (s *Supervisor) Supervise() error {
 			s.log.Infof("respawning in %s", s.TimeoutRespawn.String())
 
 			select {
-			case <-s.quit:
-				s.log.Debug("respawn cancelled")
+			case <-ctx.Done():
+				s.log.Debugf("respawn canceled (%v)", context.Cause(ctx))
 				return
 			case <-time.After(s.TimeoutRespawn):
 				s.log.Debug("respawning")
 			}
 		}
 	}()
-	return <-started
-}
 
-// Stop stops the supervised
-func (s *Supervisor) Stop() error {
-	if s.quit != nil {
-		s.quit <- true
-		<-s.done
+	if err := <-started; err != nil {
+		cancel(err)
+		<-done
+		return err
+	}
+
+	s.stop = func(opts StopOpts) {
+		cancel(&stoppingErr{opts})
+		<-done
 	}
 	return nil
 }
 
-// Modifies the current processes env so that we inject k0s embedded bins into path
-func getEnv(dataDir string) []string {
-	env := os.Environ()
-	for i, e := range env {
-		if strings.HasPrefix(e, "PATH=") {
-			env[i] = fmt.Sprintf("PATH=%s:%s", path.Join(dataDir, "bin"), os.Getenv("PATH"))
-		}
+// Stops the supervised process using the default stop behavior.
+func (s *Supervisor) Stop() error {
+	return s.StopWith(StopOpts{})
+}
+
+// Stops the supervised process using the provided options.
+func (s *Supervisor) StopWith(opts StopOpts) error {
+	s.startStopMutex.Lock()
+	defer s.startStopMutex.Unlock()
+	if s.stop == nil {
+		return errors.New("not started")
 	}
-	return env
+
+	s.stop(opts)
+	s.stop = nil
+	return nil
+}
+
+// Checks if the process referenced in the PID file is a k0s-managed process.
+// If so, requests graceful termination and waits for the process to terminate.
+//
+// The PID file itself is not removed here; that is handled by the caller.
+func (s *Supervisor) maybeCleanupPIDFile(ctx context.Context) error {
+	pid, err := os.ReadFile(s.PidFile)
+	if os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("failed to read PID file %s: %w", s.PidFile, err)
+	}
+
+	p, err := strconv.Atoi(strings.TrimSuffix(string(pid), "\n"))
+	if err != nil {
+		return fmt.Errorf("failed to parse PID file %s: %w", s.PidFile, err)
+	}
+
+	return s.cleanupPID(ctx, p)
+}
+
+// Prepare the env for exec:
+// - handle component specific env
+// - inject k0s embedded bins into path
+func getEnv(dataDir, component string, keepEnvPrefix bool) []string {
+	env := os.Environ()
+	componentPrefix := strings.ToUpper(component) + "_"
+
+	// put the component specific env vars in the front.
+	sort.Slice(env, func(i, j int) bool { return strings.HasPrefix(env[i], componentPrefix) })
+
+	overrides := map[string]struct{}{}
+	i := 0
+	for _, e := range env {
+		kv := strings.SplitN(e, "=", 2)
+		k, v := kv[0], kv[1]
+		// if there is already a correspondent component specific env, skip it.
+		if _, ok := overrides[k]; ok {
+			continue
+		}
+		if strings.HasPrefix(k, componentPrefix) {
+			var shouldOverride bool
+			k1 := strings.TrimPrefix(k, componentPrefix)
+			switch k1 {
+			// always override proxy env
+			case "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY":
+				shouldOverride = true
+			default:
+				if !keepEnvPrefix {
+					shouldOverride = true
+				}
+			}
+			if shouldOverride {
+				k = k1
+				overrides[k] = struct{}{}
+			}
+		}
+		switch k {
+		case "PATH":
+			env[i] = "PATH=" + dir.PathListJoin(filepath.Join(dataDir, "bin"), v)
+		default:
+			env[i] = fmt.Sprintf("%s=%s", k, v)
+		}
+		i++
+	}
+	env = append([]string{k0sManaged}, env...)
+	i++
+
+	return env[:i]
+}
+
+// GetProcess returns the last started process
+func (s *Supervisor) GetProcess() *os.Process {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if s.cmd == nil {
+		return nil
+	}
+	return s.cmd.Process
 }

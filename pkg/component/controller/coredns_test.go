@@ -1,21 +1,40 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package controller
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+
+	"github.com/k0sproject/k0s/internal/pkg/templatewriter"
+	"github.com/k0sproject/k0s/pkg/apis/k0s/v1beta1"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestCoreDNS_RenderWithPatch(t *testing.T) {
+	cfg := coreDNSConfig{
+		Replicas:      1,
+		ClusterDomain: "cluster.local",
+		ClusterDNSIP:  "10.96.0.10",
+		Image:         "coredns:latest",
+		PullPolicy:    "IfNotPresent",
+	}
+	tw := templatewriter.TemplateWriter{
+		Name:     "coredns",
+		Template: coreDNSTemplate,
+		Data:     cfg,
+		Patches: v1beta1.Patches{{
+			Target: v1beta1.PatchTarget{Kind: "Deployment", Name: "coredns"},
+			Patch:  v1beta1.PatchSpec{Type: v1beta1.MergePatchType, Content: `{"metadata":{"annotations":{"patched":"true"}}}`},
+		}},
+	}
+	var buf bytes.Buffer
+	require.NoError(t, tw.WriteToBuffer(&buf))
+	assert.Contains(t, buf.String(), "patched")
+}
 
 func Test_replicaCount(t *testing.T) {
 	tests := []struct {

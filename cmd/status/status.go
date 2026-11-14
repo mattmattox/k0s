@@ -1,83 +1,132 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package status
 
 import (
+	"encoding/json"
 	"fmt"
-	"os"
+	"io"
 	"runtime"
-	"strings"
 
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/cobra"
-
+	"github.com/k0sproject/k0s/cmd/internal"
+	"github.com/k0sproject/k0s/pkg/component/status"
 	"github.com/k0sproject/k0s/pkg/config"
-	"github.com/k0sproject/k0s/pkg/install"
-)
 
-type CmdOpts config.CLIOptions
-
-var (
-	output string
-	s      *install.K0sStatus
+	"github.com/spf13/cobra"
+	"sigs.k8s.io/yaml"
 )
 
 func NewStatusCmd() *cobra.Command {
-	s = &install.K0sStatus{}
+	var (
+		debugFlags internal.DebugFlags
+		output     string
+	)
+
 	cmd := &cobra.Command{
-		Use:     "status",
-		Short:   "Helper command for get general information about k0s",
-		Example: `The command will return information about system init, PID, k0s role, kubeconfig and similar.`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if runtime.GOOS == "windows" {
-				return fmt.Errorf("currently not supported on windows")
-			}
-			var err error
-			if s, err = install.GetPid(); err != nil {
+		Use:              "status",
+		Short:            "Get k0s instance status information",
+		Example:          `The command will return information about system init, PID, k0s role, kubeconfig and similar.`,
+		PersistentPreRun: debugFlags.Run,
+		Args:             cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			opts, err := config.GetCmdOpts(cmd)
+			if err != nil {
 				return err
 			}
 
-			if s.Pid != 0 {
-				ver, err := s.GetK0sVersion()
-				if err != nil {
-					return err
-				}
-				s.Version = ver
-
-				if os.Geteuid() != 0 {
-					logrus.Fatal("k0s status must be run as root!")
-				}
-
-				if s.Role, err = install.GetRoleByPID(s.Pid); err != nil {
-					return err
-				}
-
-				if s.SysInit, s.StubFile, err = install.GetSysInit(strings.TrimSuffix(s.Role, "+worker")); err != nil {
-					return err
-				}
-			} else {
-				fmt.Fprintln(os.Stderr, "K0s not running")
-				os.Exit(1)
+			statusInfo, err := status.GetStatusInfo(opts.K0sVars.StatusSocketPath)
+			if err != nil {
+				return err
 			}
-			s.Output = output
-			s.String()
+			if statusInfo != nil {
+				printStatus(cmd.OutOrStdout(), statusInfo, output)
+			} else {
+				return config.ErrK0sNotRunning
+			}
 			return nil
 		},
 	}
-	cmd.SilenceUsage = true
-	cmd.PersistentFlags().StringVarP(&output, "out", "o", "", "sets type of output to json or yaml")
+
+	pflags := cmd.PersistentFlags()
+	debugFlags.AddToFlagSet(pflags)
+	var socketDefault string
+	if runtime.GOOS == "windows" {
+		socketDefault = status.DefaultSocketPath
+	} else {
+		socketDefault = "<rundir>/status.sock"
+	}
+
+	pflags.String("status-socket", "", "Full path to the k0s status socket (default: "+socketDefault+")")
+
+	cmd.AddCommand(NewStatusSubCmdComponents())
+
+	cmd.Flags().StringVarP(&output, "out", "o", "", "sets type of output to json or yaml")
+
 	return cmd
+}
+
+func NewStatusSubCmdComponents() *cobra.Command {
+	var maxCount int
+
+	cmd := &cobra.Command{
+		Use:     "components",
+		Short:   "Get k0s instance component status information",
+		Example: `The command will return information about k0s components.`,
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			opts, err := config.GetCmdOpts(cmd)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.ErrOrStderr(), "!!! per component status is not yet finally ready, information here might be not full yet")
+			state, err := status.GetComponentStatus(opts.K0sVars.StatusSocketPath, maxCount)
+			if err != nil {
+				return err
+			}
+			d, err := yaml.Marshal(state)
+			if err != nil {
+				return err
+			}
+			fmt.Println(string(d))
+			return nil
+		},
+	}
+
+	flags := cmd.Flags()
+	flags.IntVar(&maxCount, "max-count", 1, "how many latest probes to show")
+	flags.StringP("out", "o", "", "")
+	outFlag := flags.Lookup("out")
+	outFlag.Hidden = true
+	outFlag.Deprecated = "it has no effect and will be removed in a future release"
+
+	return cmd
+}
+
+func printStatus(w io.Writer, status *status.K0sStatus, output string) {
+	switch output {
+	case "json":
+		jsn, _ := json.MarshalIndent(status, "", "   ")
+		fmt.Fprintln(w, string(jsn))
+	case "yaml":
+		ym, _ := yaml.Marshal(status)
+		fmt.Fprintln(w, string(ym))
+	default:
+		fmt.Fprintln(w, "Version:", status.Version)
+		fmt.Fprintln(w, "Process ID:", status.Pid)
+		fmt.Fprintln(w, "Role:", status.Role)
+		fmt.Fprintln(w, "Workloads:", status.Workloads)
+		fmt.Fprintln(w, "SingleNode:", status.SingleNode)
+		if status.Workloads {
+			fmt.Fprintln(w, "Kube-api probing successful:", status.WorkerToAPIConnectionStatus.Success)
+			fmt.Fprintln(w, "Kube-api probing last error: ", status.WorkerToAPIConnectionStatus.Message)
+		}
+		if status.SysInit != "" {
+			fmt.Fprintln(w, "Init System:", status.SysInit)
+		}
+		if status.StubFile != "" {
+			fmt.Fprintln(w, "Service file:", status.StubFile)
+		}
+
+	}
 }

@@ -1,58 +1,76 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2020 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package controller
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/k0sproject/k0s/internal/util"
-	config "github.com/k0sproject/k0s/pkg/apis/v1beta1"
-	"github.com/k0sproject/k0s/pkg/assets"
+	"github.com/k0sproject/k0s/internal/assets"
+	"github.com/k0sproject/k0s/internal/pkg/stringmap"
+	"github.com/k0sproject/k0s/internal/pkg/users"
+	"github.com/k0sproject/k0s/pkg/apis/k0s/v1beta1"
+	"github.com/k0sproject/k0s/pkg/component/featuregates"
+	"github.com/k0sproject/k0s/pkg/component/manager"
+	"github.com/k0sproject/k0s/pkg/config"
 	"github.com/k0sproject/k0s/pkg/constant"
 	"github.com/k0sproject/k0s/pkg/supervisor"
 )
 
 // Scheduler implement the component interface to run kube scheduler
 type Scheduler struct {
-	ClusterConfig *config.ClusterConfig
-	gid           int
-	K0sVars       constant.CfgVars
-	LogLevel      string
-	supervisor    supervisor.Supervisor
-	uid           int
+	K0sVars               *config.CfgVars
+	LogLevel              string
+	DisableLeaderElection bool
+
+	supervisor     *supervisor.Supervisor
+	executablePath string
+	uid            int
+	previousConfig stringmap.StringMap
 }
 
+var _ manager.Component = (*Scheduler)(nil)
+var _ manager.Reconciler = (*Scheduler)(nil)
+
+const kubeSchedulerComponentName = "kube-scheduler"
+
 // Init extracts the needed binaries
-func (a *Scheduler) Init() error {
+func (a *Scheduler) Init(_ context.Context) error {
 	var err error
-	a.uid, err = util.GetUID(constant.SchedulerUser)
+	a.uid, err = users.LookupUID(constant.SchedulerUser)
 	if err != nil {
-		logrus.Warning(fmt.Errorf("running kube-scheduler as root: %w", err))
+		err = fmt.Errorf("failed to lookup UID for %q: %w", constant.SchedulerUser, err)
+		a.uid = users.RootUID
+		logrus.WithError(err).Warn("Running kube-scheduler as root")
 	}
-	return assets.Stage(a.K0sVars.BinDir, "kube-scheduler", constant.BinDirMode)
+	a.executablePath, err = assets.StageExecutable(a.K0sVars.BinDir, kubeSchedulerComponentName)
+	return err
 }
 
 // Run runs kube scheduler
-func (a *Scheduler) Run() error {
+func (a *Scheduler) Start(_ context.Context) error {
+	return nil
+}
+
+// Stop stops Scheduler
+func (a *Scheduler) Stop() error {
+	if a.supervisor != nil {
+		return a.supervisor.Stop()
+	}
+	return nil
+}
+
+// Reconcile detects changes in configuration and applies them to the component
+func (a *Scheduler) Reconcile(ctx context.Context, clusterConfig *v1beta1.ClusterConfig) error {
+	logrus.Debug("reconcile method called for: Scheduler")
+
 	logrus.Info("Starting kube-scheduler")
 	schedulerAuthConf := filepath.Join(a.K0sVars.CertRootDir, "scheduler.conf")
-	args := map[string]string{
+	args := stringmap.StringMap{
 		"authentication-kubeconfig": schedulerAuthConf,
 		"authorization-kubeconfig":  schedulerAuthConf,
 		"kubeconfig":                schedulerAuthConf,
@@ -61,38 +79,39 @@ func (a *Scheduler) Run() error {
 		"profiling":                 "false",
 		"v":                         a.LogLevel,
 	}
-	for name, value := range a.ClusterConfig.Spec.Scheduler.ExtraArgs {
-		if args[name] != "" && name != "profiling" {
-			return fmt.Errorf("cannot override kube-scheduler flag: %s", name)
+	for name, value := range clusterConfig.Spec.Scheduler.ExtraArgs {
+		if _, ok := args[name]; ok {
+			logrus.Warnf("overriding kube-scheduler flag with user provided value: %s", name)
 		}
 		args[name] = value
 	}
-	var schedulerArgs []string
-	for name, value := range args {
-		schedulerArgs = append(schedulerArgs, fmt.Sprintf("--%s=%s", name, value))
+	if a.DisableLeaderElection {
+		args["leader-elect"] = "false"
 	}
-	if a.ClusterConfig.Spec.API.ExternalAddress == "" {
-		schedulerArgs = append(schedulerArgs, "--leader-elect=false")
+	args = featuregates.ToArgs(args, clusterConfig.Spec.FeatureGates, kubeSchedulerComponentName)
+
+	if args.Equals(a.previousConfig) && a.supervisor != nil {
+		// no changes and supervisor already running, do nothing
+		logrus.WithField("component", kubeSchedulerComponentName).Info("reconcile has nothing to do")
+		return nil
+	}
+	// Stop in case there's process running already and we need to change the config
+	if a.supervisor != nil {
+		logrus.WithField("component", kubeSchedulerComponentName).Info("reconcile has nothing to do")
+		if err := a.supervisor.Stop(); err != nil {
+			logrus.WithField("component", kubeSchedulerComponentName).WithError(err).Error("Failed to stop executable")
+		}
+		a.supervisor = nil
 	}
 
-	a.supervisor = supervisor.Supervisor{
-		Name:    "kube-scheduler",
-		BinPath: assets.BinPath("kube-scheduler", a.K0sVars.BinDir),
+	a.supervisor = &supervisor.Supervisor{
+		Name:    kubeSchedulerComponentName,
+		BinPath: a.executablePath,
 		RunDir:  a.K0sVars.RunDir,
 		DataDir: a.K0sVars.DataDir,
-		Args:    schedulerArgs,
+		Args:    append(args.ToDashedArgs(), clusterConfig.Spec.Scheduler.RawArgs...),
 		UID:     a.uid,
-		GID:     a.gid,
 	}
-	// TODO We need to dump the config file suited for k0s use
-
-	return a.supervisor.Supervise()
+	a.previousConfig = args
+	return a.supervisor.Supervise(ctx)
 }
-
-// Stop stops Scheduler
-func (a *Scheduler) Stop() error {
-	return a.supervisor.Stop()
-}
-
-// Health-check interface
-func (a *Scheduler) Healthy() error { return nil }

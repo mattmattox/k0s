@@ -1,77 +1,114 @@
-/*
-Copyright 2021 k0s authors
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: 2020 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
 package controller
 
 import (
-	"fmt"
+	"context"
+	"errors"
+	"time"
 
+	"github.com/k0sproject/k0s/pkg/applier"
+	"github.com/k0sproject/k0s/pkg/component/controller/leaderelector"
+	"github.com/k0sproject/k0s/pkg/component/manager"
+	"github.com/k0sproject/k0s/pkg/kubernetes"
+	"github.com/k0sproject/k0s/pkg/leaderelection"
 	"github.com/k0sproject/k0s/static"
+	"github.com/sirupsen/logrus"
 )
 
-// CRD unpacks bundled CRD definitions to the filesystem
-type CRD struct {
-	saver manifestsSaver
+// CRDStack applies bundled CRDs.
+type CRDStack struct {
+	clients       kubernetes.ClientFactoryInterface
+	leaderElector leaderelector.Interface
+	bundle        string
+	stop          func()
+
+	crdOpts
 }
 
-// NewCRD build new CRD
-func NewCRD(s manifestsSaver) *CRD {
-	return &CRD{
-		saver: s,
+type crdOpts struct {
+	stackName string
+}
+
+type CRDOption func(*crdOpts)
+
+var _ manager.Component = (*CRDStack)(nil)
+
+// Creates a new CRD stack for the given bundle.
+func NewCRDStack(clients kubernetes.ClientFactoryInterface, leaderElector leaderelector.Interface, bundle string, opts ...CRDOption) *CRDStack {
+	var options crdOpts
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	if options.stackName == "" {
+		options.stackName = bundle
+	}
+
+	return &CRDStack{
+		clients:       clients,
+		leaderElector: leaderElector,
+		bundle:        bundle,
+		crdOpts:       options,
 	}
 }
 
-var bundles = []string{
-	"helm",
+func WithStackName(stackName string) CRDOption {
+	return func(opts *crdOpts) { opts.stackName = stackName }
 }
 
-// Init  (c CRD) Init() error {
-func (c CRD) Init() error {
+// Init implements [manager.Component]. It does nothing.
+func (c *CRDStack) Init(ctx context.Context) error {
 	return nil
 }
 
-// Run unpacks manifests from bindata
-func (c CRD) Run() error {
-	for _, bundle := range bundles {
-		crds, err := static.AssetDir(fmt.Sprintf("manifests/%s/CustomResourceDefinition", bundle))
+// Applies this CRD stack when becoming the leader. Implements [manager.Component].
+func (c *CRDStack) Start(context.Context) error {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	done := make(chan struct{})
 
-		if err != nil {
-			return fmt.Errorf("can't unbundle CRD `%s` manifests: %v", bundle, err)
-		}
-
-		for _, filename := range crds {
-			manifestName := fmt.Sprintf("%s-crd-%s", bundle, filename)
-			content, err := static.Asset(fmt.Sprintf("manifests/%s/CustomResourceDefinition/%s", bundle, filename))
+	go func() {
+		defer close(done)
+		leaderelection.RunLeaderTasks(ctx, c.leaderElector.CurrentStatus, func(ctx context.Context) {
+			resources, err := applier.ReadUnstructuredDir(static.CRDs, c.bundle)
 			if err != nil {
-				return fmt.Errorf("failed to fetch crd `%s`: %v", filename, err)
+				logrus.WithError(err).Errorf("Failed to read %s CRD stack", c.bundle)
+				return
 			}
-			if err := c.saver.Save(manifestName, content); err != nil {
-				return fmt.Errorf("failed to save CRD `%s` manifest `%s` to FS: %v", bundle, manifestName, err)
-			}
-		}
 
+			stack := applier.Stack{
+				Name:      c.stackName,
+				Resources: resources,
+				Clients:   applier.NewClients(c.clients),
+			}
+
+			for {
+				err := stack.Apply(ctx, true)
+				if err == nil {
+					break
+				}
+
+				logrus.WithError(err).Errorf("Failed to apply %s CRD stack, retrying in 30 seconds", c.bundle)
+
+				select {
+				case <-time.After(30 * time.Second):
+				case <-ctx.Done():
+					return
+				}
+			}
+		})
+	}()
+
+	c.stop = func() { cancel(errors.New("CRD stack is stopping")); <-done }
+
+	return nil
+}
+
+// Stop implements [manager.Component].
+func (c *CRDStack) Stop() error {
+	if stop := c.stop; stop != nil {
+		stop()
 	}
-
-	return nil
-}
-
-func (c CRD) Stop() error {
-	return nil
-}
-
-func (c CRD) Healthy() error {
 	return nil
 }

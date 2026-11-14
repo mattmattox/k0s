@@ -1,0 +1,125 @@
+// SPDX-FileCopyrightText: 2020 k0s authors
+// SPDX-License-Identifier: Apache-2.0
+
+package v1beta1
+
+import (
+	"github.com/sirupsen/logrus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/yaml"
+)
+
+// SecretReference identifies a secret in a specific namespace.
+type SecretReference struct {
+	// Name of the secret.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+	// Namespace of the secret. If empty, defaults to the Chart resource's namespace.
+	Namespace string `json:"namespace,omitempty"`
+}
+
+// ConfigSource describes the source of repository configuration values.
+type ConfigSource struct {
+	// SecretRef references a Kubernetes Secret containing repository configuration.
+	// Secret keys should match standard Kubernetes TLS secret keys (ca.crt, tls.crt, tls.key)
+	// plus repository-specific keys (url, username, password, insecure).
+	// Secret values override inline RepositorySpec fields.
+	SecretRef *SecretReference `json:"secretRef,omitempty"`
+}
+
+// RepositorySpec describes a Helm repository configuration for a Chart.
+// Fields map to the CLI flags for the "helm repo add" command.
+type RepositorySpec struct {
+	// The repository URL.
+	// +kubebuilder:validation:MinLength=1
+	URL string `json:"url,omitempty"`
+	// Username for Basic HTTP authentication.
+	Username string `json:"username,omitempty"`
+	// Password for Basic HTTP authentication.
+	Password string `json:"password,omitempty"`
+	// CA bundle file to use when verifying HTTPS-enabled servers.
+	CAFile string `json:"caFile,omitempty"`
+	// The TLS certificate file to use for HTTPS client authentication.
+	CertFile string `json:"certFile,omitempty"`
+	// The TLS key file to use for HTTPS client authentication.
+	KeyFile string `json:"keyFile,omitempty"`
+	// Whether to skip TLS certificate checks when connecting to the repository.
+	Insecure *bool `json:"insecure,omitempty"`
+	// ConfigFrom specifies the source of repository configuration values.
+	// Secret values override inline fields when present.
+	ConfigFrom *ConfigSource `json:"configFrom,omitempty"`
+}
+
+// ChartSpec defines the desired state of Chart
+type ChartSpec struct {
+	ChartName   string `json:"chartName,omitempty"`
+	ReleaseName string `json:"releaseName,omitempty"`
+	Values      string `json:"values,omitempty"`
+	Version     string `json:"version,omitempty"`
+	Namespace   string `json:"namespace,omitempty"`
+	Timeout     string `json:"timeout,omitempty"`
+	// ForceUpgrade when set to false, disables the use of the "--force" flag when upgrading the chart (default: true).
+	ForceUpgrade *bool `json:"forceUpgrade,omitempty"`
+	Order        int   `json:"order,omitempty"`
+	// Repository configuration for the chart. When specified, the chart will use this
+	// repository configuration instead of looking up a repository from the cluster-level
+	// repository cache. This enables self-contained Chart resources.
+	Repository *RepositorySpec `json:"repository,omitempty"`
+}
+
+// YamlValues returns values as map
+func (s *ChartSpec) YamlValues() map[string]any {
+	res := map[string]any{}
+	if err := yaml.Unmarshal([]byte(s.Values), &res); err != nil {
+		logrus.WithField("values", s.Values).Warn("broken yaml values")
+	}
+	// We need to clean the map to have nested maps as map[string]interface{} types
+	// otherwise Helm will fail to merge default values and create the release object
+	return CleanUpGenericMap(res)
+}
+
+// ShouldForceUpgrade returns true if the chart should be force upgraded
+func (s *ChartSpec) ShouldForceUpgrade() bool {
+	// This defaults to true when not explicitly set to false.
+	// Better have this the other way round in the next API version.
+	return s.ForceUpgrade == nil || *s.ForceUpgrade
+}
+
+// ChartStatus defines the observed state of Chart
+type ChartStatus struct {
+	ReleaseName string `json:"releaseName,omitempty"`
+	Status      string `json:"status,omitempty"`
+	AppVersion  string `json:"appVersion,omitempty"`
+	Version     string `json:"version,omitempty"`
+	Updated     string `json:"updated,omitempty"`
+	Namespace   string `json:"namespace,omitempty"`
+	Revision    int64  `json:"revision,omitempty"`
+	ValuesHash  string `json:"valuesHash,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +kubebuilder:subresource:status
+// +genclient
+// +genclient:onlyVerbs=create,delete,list,get,watch,update
+// Chart is the Schema for the charts API
+type Chart struct {
+	metav1.TypeMeta `json:",inline"`
+	// +optional
+	metav1.ObjectMeta `json:"metadata"`
+
+	// +optional
+	Spec ChartSpec `json:"spec"`
+	// +optional
+	Status ChartStatus `json:"status"`
+}
+
+// +kubebuilder:object:root=true
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// ChartList contains a list of Chart
+type ChartList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata"`
+	Items           []Chart `json:"items"`
+}

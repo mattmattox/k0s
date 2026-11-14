@@ -1,99 +1,134 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2020 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package applier
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"sync"
 	"time"
 
-	"k8s.io/client-go/util/retry"
+	"github.com/avast/retry-go"
 
-	"github.com/k0sproject/k0s/pkg/debounce"
-	"github.com/k0sproject/k0s/pkg/kubernetes"
+	"github.com/fsnotify/fsnotify"
 	"github.com/sirupsen/logrus"
-	"gopkg.in/fsnotify.v1"
 )
 
-// StackApplier handles each directory as a Stack and watches for changes
+// StackApplier applies a stack whenever the files on disk change.
 type StackApplier struct {
-	Path string
+	log  logrus.FieldLogger
+	path string
 
-	fsWatcher *fsnotify.Watcher
-	applier   Applier
-	log       *logrus.Entry
-	done      chan bool
+	doApply, doDelete func(context.Context) error
 }
 
 // NewStackApplier crates new stack applier to manage a stack
-func NewStackApplier(path string, kubeClientFactory kubernetes.ClientFactory) (*StackApplier, error) {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return nil, err
-	}
-	err = watcher.Add(path)
-	if err != nil {
-		return nil, err
-	}
-	applier := NewApplier(path, kubeClientFactory)
-	log := logrus.WithField("component", "applier-"+applier.Name)
-	log.WithField("path", path).Debug("created stack applier")
+func NewStackApplier(path string, clients Clients) *StackApplier {
+	var mu sync.Mutex
+	applier := NewApplier(path, clients)
 
 	return &StackApplier{
-		Path:      path,
-		fsWatcher: watcher,
-		applier:   applier,
-		log:       log,
-		done:      make(chan bool, 1),
-	}, nil
+		log:  logrus.WithField("component", "applier-"+applier.Name),
+		path: path,
+
+		doApply: func(ctx context.Context) error {
+			mu.Lock()
+			defer mu.Unlock()
+			return applier.Apply(ctx)
+		},
+
+		doDelete: func(ctx context.Context) error {
+			mu.Lock()
+			defer mu.Unlock()
+			return applier.Delete(ctx)
+		},
+	}
 }
 
-// Start both the initial apply and also the watch for a single stack
-func (s *StackApplier) Start() error {
-	debouncer := debounce.New(5*time.Second, s.fsWatcher.Events, func(arg fsnotify.Event) {
-		s.log.Debug("debouncer triggering, applying...")
-		err := retry.OnError(retry.DefaultRetry, func(err error) bool {
-			return true
-		}, s.applier.Apply)
-		if err != nil {
-			s.log.Warnf("failed to apply manifests: %s", err.Error())
+// Run watches the stack for updates and executes the initial apply.
+func (s *StackApplier) Run(ctx context.Context) error {
+	if ctx.Err() != nil {
+		return nil // The context is already done.
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("failed to create watcher: %w", err)
+	}
+
+	trigger := make(chan struct{}, 1)
+	watchErr := make(chan error, 1)
+	go func() { watchErr <- s.runWatcher(watcher, trigger, ctx.Done()) }()
+
+	if err := watcher.Add(s.path); err != nil {
+		return fmt.Errorf("failed to watch %q: %w", s.path, err)
+	}
+
+	for {
+		select {
+		case <-trigger:
+			s.apply(ctx)
+		case err := <-watchErr:
+			return err
 		}
-	})
-	defer debouncer.Stop()
-	go debouncer.Start()
-
-	// apply all changes on start
-	s.fsWatcher.Events <- fsnotify.Event{}
-
-	<-s.done
-
-	return nil
+	}
 }
 
-// Stop stops the stack applier and removes the stack
-func (s *StackApplier) Stop() error {
-	s.log.WithField("stack", s.Path).Info("stopping and deleting stack")
-	s.done <- true
-	close(s.done)
+func (s *StackApplier) runWatcher(watcher *fsnotify.Watcher, trigger chan<- struct{}, stop <-chan struct{}) (err error) {
+	defer func() { err = errors.Join(err, watcher.Close()) }()
 
-	return nil
+	const timeout = 1 * time.Second // debounce events for one second
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case err := <-watcher.Errors:
+			return fmt.Errorf("while watching stack: %w", err)
+
+		case event := <-watcher.Events:
+			// Only consider events on manifest files
+			if match, _ := filepath.Match(manifestFilePattern, filepath.Base(event.Name)); !match {
+				continue
+			}
+			timer.Reset(timeout)
+
+		case <-timer.C:
+			select {
+			case trigger <- struct{}{}:
+			default:
+			}
+
+		case <-stop:
+			return nil
+		}
+	}
+}
+
+func (s *StackApplier) apply(ctx context.Context) {
+	s.log.Info("Applying manifests")
+
+	err := retry.Do(
+		func() error { return s.doApply(ctx) },
+		retry.OnRetry(func(attempt uint, err error) {
+			s.log.WithError(err).Warnf("Failed to apply manifests in attempt #%d, retrying after backoff", attempt+1)
+		}),
+		retry.Context(ctx),
+		retry.LastErrorOnly(true),
+	)
+
+	if err != nil {
+		s.log.WithError(err).Error("Failed to apply manifests")
+	}
 }
 
 // DeleteStack deletes the associated stack
-func (s *StackApplier) DeleteStack() error {
-	return s.applier.Delete()
+func (s *StackApplier) DeleteStack(ctx context.Context) error {
+	return s.doDelete(ctx)
 }
-
-// Health-check interface
-func (s *StackApplier) Healthy() error { return nil }

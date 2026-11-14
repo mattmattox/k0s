@@ -1,0 +1,103 @@
+# OS testing matrix. See ../../hack/ostests/README.md for details.
+
+name: "OS tests :: Matrix"
+
+on:
+  workflow_dispatch:
+    inputs:
+      k0s-version:
+        type: string
+        description: The k0s version to test. Will build k0s from source if empty.
+      k0sctl-version:
+        type: string
+        description: The k0sctl version to use when bootstrapping test clusters.
+        default: 0.33.1 # renovate: datasource=github-releases depName=k0sproject/k0sctl
+      e2e-concurrency-level:
+        type: number
+        description: The number of tests that may be run concurrently.
+        default: 2
+      e2e-focus:
+        type: string
+        description: The selector for the e2e tests to be run.
+        default: \[Conformance\]
+      fail-fast:
+        type: boolean
+        description: Stop each e2e test suite after the first test failure.
+        default: false
+      oses:
+        type: string
+        description: The operating systems to test.
+        required: true
+        default: >-
+          [
+            "al2023",
+            "alpine_3_22", "alpine_3_24",
+            "centos_9", "centos_10",
+            "debian_12", "debian_13",
+            "fcos_stable",
+            "fedora_45",
+            "flatcar",
+            "rhel_8", "rhel_9", "rhel_10",
+            "rocky_8", "rocky_9", "rocky_10",
+            "sles_15",
+            "ubuntu_2204", "ubuntu_2404", "ubuntu_2604"
+          ]
+      arch:
+        type: string
+        description: The processor architecture to test.
+        required: true
+        default: amd64
+      network-providers:
+        type: string
+        description: The k0s network providers to test.
+        required: true
+        default: >-
+          [
+            "kuberouter",
+            "calico"
+          ]
+      kube-proxy-modes:
+        type: string
+        description: The k0s kube-proxy modes to test.
+        required: true
+        default: >-
+          [
+            "iptables",
+            "ipvs"
+          ]
+
+run-name: "OS tests :: ${{ inputs.arch }}"
+
+jobs:
+  build:
+    name: Build
+    if: inputs.k0s-version == ''
+    uses: ./.github/workflows/build-k0s.yml
+    with: { target-os: linux, target-arch: "${{ inputs.arch }}" }
+
+  e2e-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.oses) }}
+        network-provider: ${{ fromJSON(inputs.network-providers) }}
+        kube-proxy-mode: ${{ fromJSON(inputs.kube-proxy-modes) }}
+
+    name: "${{ matrix.os }} :: ${{ matrix.network-provider }} :: ${{ matrix.kube-proxy-mode }}"
+    needs: build
+    if: always() && (inputs.k0s-version != '' || needs.build.result == 'success')
+    uses: ./.github/workflows/ostests-e2e.yaml
+    with:
+      k0s-version: ${{ inputs.k0s-version }}
+      k0sctl-version: ${{ inputs.k0sctl-version }}
+      e2e-concurrency-level: ${{ fromJSON(inputs.e2e-concurrency-level) }} # infamous GH workflows bug that looses type information (actions/runner#2206)
+      e2e-focus: ${{ inputs.e2e-focus }}
+      fail-fast: ${{ inputs.fail-fast }}
+      os: ${{ matrix.os }}
+      arch: ${{ inputs.arch }}
+      network-provider: ${{ matrix.network-provider }}
+      kube-proxy-mode: ${{ matrix.kube-proxy-mode }}
+    secrets:
+      aws-access-key-id: ${{ secrets.AWS_TERRAFORM_ID }}
+      aws-secret-access-key: ${{ secrets.AWS_TERRAFORM_KEY }}
+      aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}

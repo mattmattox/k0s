@@ -1,126 +1,124 @@
-/*
-Copyright 2020 k0s authors
+// SPDX-FileCopyrightText: 2020 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package controller
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"testing"
 
-	"github.com/k0sproject/k0s/internal/testutil"
-	"github.com/k0sproject/k0s/pkg/apis/v1beta1"
-	"github.com/stretchr/testify/assert"
+	"github.com/k0sproject/k0s/pkg/apis/k0s/v1beta1"
+	"github.com/k0sproject/k0s/pkg/leaderelection"
+
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+
+	"github.com/k0sproject/k0s/internal/testutil"
+	"github.com/stretchr/testify/assert"
 )
 
-var expectedAddresses = []string{
-	"185.199.108.153",
-	"185.199.109.153",
-	"185.199.110.153",
-	"185.199.111.153",
+var expectedIPv4Addresses = []string{
+	"240.0.0.2",
+	"240.0.0.3",
+}
+
+var expectedIPv6Addresses = []string{
+	"2001:db8::1",
+	"2001:db8::2",
 }
 
 func TestBasicReconcilerWithNoLeader(t *testing.T) {
 	fakeFactory := testutil.NewFakeClientFactory()
 
-	config := &v1beta1.ClusterConfig{
-		Spec: &v1beta1.ClusterSpec{
-			API: &v1beta1.APISpec{
-				Address:         "1.2.3.4",
-				ExternalAddress: "get.k0s.sh",
-			},
-		},
-	}
+	config := getFakeConfig()
 
-	r := NewEndpointReconciler(config, &DummyLeaderElector{Leader: false}, fakeFactory)
+	leaderStatus := func() leaderelection.Status { return leaderelection.StatusPending }
+	r := NewEndpointReconciler(config, leaderStatus, fakeFactory, fakeResolver{}, v1beta1.PrimaryFamilyIPv4)
 
-	assert.NoError(t, r.Init())
+	ctx := t.Context()
+	assert.NoError(t, r.Init(ctx))
 
-	assert.NoError(t, r.reconcileEndpoints())
+	assert.NoError(t, r.reconcileEndpoints(ctx))
 	client, err := fakeFactory.GetClient()
 	assert.NoError(t, err)
-	_, err = client.CoreV1().Endpoints("default").Get(context.TODO(), "kubernetes", v1.GetOptions{})
+	_, err = client.CoreV1().Endpoints(metav1.NamespaceDefault).Get(ctx, "kubernetes", metav1.GetOptions{})
 	// The reconciler should not make any modification as we're not the leader so the endpoint should not get created
 	assert.Error(t, err)
-	assert.True(t, errors.IsNotFound(err))
-	//verifyEndpointAddresses(t, expectedAddresses, fakeFactory)
+	assert.True(t, k8serrors.IsNotFound(err))
+	// verifyEndpointAddresses(t, expectedAddresses, fakeFactory)
 }
 
 func TestBasicReconcilerWithNoExistingEndpoint(t *testing.T) {
-	fakeFactory := testutil.NewFakeClientFactory()
-	config := &v1beta1.ClusterConfig{
-		Spec: &v1beta1.ClusterSpec{
-			API: &v1beta1.APISpec{
-				Address:         "1.2.3.4",
-				ExternalAddress: "get.k0s.sh",
-			},
+	tests := []struct {
+		afnet             v1beta1.PrimaryAddressFamilyType
+		expectedAddresses []string
+	}{
+		{
+			afnet:             v1beta1.PrimaryFamilyIPv4,
+			expectedAddresses: expectedIPv4Addresses,
+		},
+		{
+			afnet:             v1beta1.PrimaryFamilyIPv6,
+			expectedAddresses: expectedIPv6Addresses,
 		},
 	}
 
-	r := NewEndpointReconciler(config, &DummyLeaderElector{Leader: true}, fakeFactory)
+	for _, test := range tests {
+		fakeFactory := testutil.NewFakeClientFactory()
+		config := getFakeConfig()
 
-	assert.NoError(t, r.Init())
+		leaderStatus := func() leaderelection.Status { return leaderelection.StatusLeading }
+		r := NewEndpointReconciler(config, leaderStatus, fakeFactory, fakeResolver{}, test.afnet)
 
-	assert.NoError(t, r.reconcileEndpoints())
-	verifyEndpointAddresses(t, expectedAddresses, fakeFactory)
+		ctx := t.Context()
+		assert.NoError(t, r.Init(ctx))
+
+		assert.NoError(t, r.reconcileEndpoints(ctx))
+		verifyEndpointAddresses(t, test.expectedAddresses, fakeFactory.Client)
+	}
 }
 
 func TestBasicReconcilerWithEmptyEndpointSubset(t *testing.T) {
 	fakeFactory := testutil.NewFakeClientFactory()
 
 	existingEp := corev1.Endpoints{
-		TypeMeta: v1.TypeMeta{
+		TypeMeta: metav1.TypeMeta{
 			Kind:       "Endpoints",
 			APIVersion: "v1",
 		},
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name: "kubernetes",
 		},
 		Subsets: []corev1.EndpointSubset{},
 	}
 	fakeClient, err := fakeFactory.GetClient()
 	assert.NoError(t, err)
-	_, err = fakeClient.CoreV1().Endpoints("default").Create(context.TODO(), &existingEp, v1.CreateOptions{})
+	ctx := t.Context()
+	_, err = fakeClient.CoreV1().Endpoints(metav1.NamespaceDefault).Create(ctx, &existingEp, metav1.CreateOptions{})
 	assert.NoError(t, err)
-	config := &v1beta1.ClusterConfig{
-		Spec: &v1beta1.ClusterSpec{
-			API: &v1beta1.APISpec{
-				Address:         "1.2.3.4",
-				ExternalAddress: "get.k0s.sh",
-			},
-		},
-	}
+	config := getFakeConfig()
 
-	r := NewEndpointReconciler(config, &DummyLeaderElector{Leader: true}, fakeFactory)
+	leaderStatus := func() leaderelection.Status { return leaderelection.StatusLeading }
+	r := NewEndpointReconciler(config, leaderStatus, fakeFactory, fakeResolver{}, v1beta1.PrimaryFamilyIPv4)
 
-	assert.NoError(t, r.Init())
+	assert.NoError(t, r.Init(ctx))
 
-	assert.NoError(t, r.reconcileEndpoints())
-	verifyEndpointAddresses(t, expectedAddresses, fakeFactory)
+	assert.NoError(t, r.reconcileEndpoints(ctx))
+	verifyEndpointAddresses(t, expectedIPv4Addresses, fakeFactory.Client)
 }
 
 func TestReconcilerWithNoNeedForUpdate(t *testing.T) {
 	fakeFactory := testutil.NewFakeClientFactory()
 	existingEp := corev1.Endpoints{
-		TypeMeta: v1.TypeMeta{
+		TypeMeta: metav1.TypeMeta{
 			Kind:       "Endpoints",
 			APIVersion: "v1",
 		},
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name: "kubernetes",
 			Annotations: map[string]string{
 				"foo": "bar",
@@ -128,39 +126,101 @@ func TestReconcilerWithNoNeedForUpdate(t *testing.T) {
 		},
 		Subsets: []corev1.EndpointSubset{
 			{
-				Addresses: stringsToEndpointAddresses(expectedAddresses),
+				Addresses: stringsToEndpointAddresses(expectedIPv4Addresses),
 			},
 		},
 	}
 
 	fakeClient, _ := fakeFactory.GetClient()
 
-	_, err := fakeClient.CoreV1().Endpoints("default").Create(context.TODO(), &existingEp, v1.CreateOptions{})
+	ctx := t.Context()
+	_, err := fakeClient.CoreV1().Endpoints(metav1.NamespaceDefault).Create(ctx, &existingEp, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
-	config := &v1beta1.ClusterConfig{
-		Spec: &v1beta1.ClusterSpec{
-			API: &v1beta1.APISpec{
-				Address:         "1.2.3.4",
-				ExternalAddress: "get.k0s.sh",
+	config := getFakeConfig()
+
+	leaderStatus := func() leaderelection.Status { return leaderelection.StatusLeading }
+	r := NewEndpointReconciler(config, leaderStatus, fakeFactory, fakeResolver{}, v1beta1.PrimaryFamilyIPv4)
+
+	assert.NoError(t, r.Init(ctx))
+
+	assert.NoError(t, r.reconcileEndpoints(ctx))
+	e := verifyEndpointAddresses(t, expectedIPv4Addresses, fakeFactory.Client)
+	assert.Equal(t, "bar", e.Annotations["foo"])
+}
+
+func TestReconcilerWithNeedForUpdate(t *testing.T) {
+	fakeFactory := testutil.NewFakeClientFactory()
+	existingEp := corev1.Endpoints{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Endpoints",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "kubernetes",
+			Annotations: map[string]string{
+				"foo": "bar",
+			},
+		},
+		Subsets: []corev1.EndpointSubset{
+			{
+				Addresses: stringsToEndpointAddresses([]string{"1.2.3.4", "1.1.1.1"}),
 			},
 		},
 	}
-	r := NewEndpointReconciler(config, &DummyLeaderElector{Leader: true}, fakeFactory)
-
-	assert.NoError(t, r.Init())
-
-	assert.NoError(t, r.reconcileEndpoints())
-	e := verifyEndpointAddresses(t, expectedAddresses, fakeFactory)
-	assert.Equal(t, "bar", e.ObjectMeta.Annotations["foo"])
-}
-
-func verifyEndpointAddresses(t *testing.T, expectedAddresses []string, fakeFactory testutil.FakeClientFactory) *corev1.Endpoints {
 
 	fakeClient, _ := fakeFactory.GetClient()
-	ep, err := fakeClient.CoreV1().Endpoints("default").Get(context.TODO(), "kubernetes", v1.GetOptions{})
+
+	ctx := t.Context()
+	_, err := fakeClient.CoreV1().Endpoints(metav1.NamespaceDefault).Create(ctx, &existingEp, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	config := getFakeConfig()
+
+	leaderStatus := func() leaderelection.Status { return leaderelection.StatusLeading }
+	r := NewEndpointReconciler(config, leaderStatus, fakeFactory, fakeResolver{}, v1beta1.PrimaryFamilyIPv4)
+	assert.NoError(t, r.Init(ctx))
+
+	assert.NoError(t, r.reconcileEndpoints(ctx))
+	e := verifyEndpointAddresses(t, expectedIPv4Addresses, fakeFactory.Client)
+	assert.Equal(t, "bar", e.Annotations["foo"])
+}
+
+func verifyEndpointAddresses(t *testing.T, expectedAddresses []string, clients kubernetes.Interface) *corev1.Endpoints {
+	ep, err := clients.CoreV1().Endpoints(metav1.NamespaceDefault).Get(t.Context(), "kubernetes", metav1.GetOptions{})
 	assert.NoError(t, err)
 	assert.Equal(t, expectedAddresses, endpointAddressesToStrings(ep.Subsets[0].Addresses))
 
 	return ep
+}
+
+type fakeResolver struct{}
+
+func (fr fakeResolver) LookupIP(ctx context.Context, afnet string, host string) ([]net.IP, error) {
+	switch afnet {
+	case "ip4":
+		return []net.IP{
+			net.ParseIP("240.0.0.2"),
+			net.ParseIP("240.0.0.3"),
+		}, nil
+	case "ip6":
+		return []net.IP{
+			net.ParseIP("2001:db8::1"),
+			net.ParseIP("2001:db8::2"),
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown address family %q", afnet)
+	}
+}
+
+func getFakeConfig() *v1beta1.ClusterConfig {
+	return &v1beta1.ClusterConfig{
+		Spec: &v1beta1.ClusterSpec{
+			API: &v1beta1.APISpec{
+				Address:         "240.0.0.1",
+				ExternalAddress: "fake.k0s",
+			},
+		},
+	}
+
 }

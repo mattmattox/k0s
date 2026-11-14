@@ -1,0 +1,896 @@
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
+
+package controller
+
+import (
+	"bytes"
+	"cmp"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+	"sync"
+	"text/template"
+	"time"
+
+	"github.com/k0sproject/k0s/internal/sync/value"
+	helmv1beta1 "github.com/k0sproject/k0s/pkg/apis/helm/v1beta1"
+	k0sv1beta1 "github.com/k0sproject/k0s/pkg/apis/k0s/v1beta1"
+	"github.com/k0sproject/k0s/pkg/applier"
+	k0sscheme "github.com/k0sproject/k0s/pkg/client/clientset/scheme"
+	"github.com/k0sproject/k0s/pkg/component/controller/leaderelector"
+	"github.com/k0sproject/k0s/pkg/component/manager"
+	"github.com/k0sproject/k0s/pkg/helm"
+	"github.com/k0sproject/k0s/pkg/kubernetes"
+	"github.com/k0sproject/k0s/pkg/leaderelection"
+	"github.com/k0sproject/k0s/static"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	apiretry "k8s.io/client-go/util/retry"
+
+	"github.com/Masterminds/sprig"
+	"github.com/bombsimon/logrusr/v4"
+	"github.com/sirupsen/logrus"
+	charts "helm.sh/helm/v4/pkg/chart"
+	"helm.sh/helm/v4/pkg/registry"
+	"helm.sh/helm/v4/pkg/release"
+	"helm.sh/helm/v4/pkg/release/common"
+	"helm.sh/helm/v4/pkg/storage/driver"
+
+	controllerruntime "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
+	crman "sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/yaml"
+)
+
+const HelmExtensionStackName = "helm"
+
+// repositoryCache provides thread-safe access to Helm repository configurations
+type repositoryCache struct {
+	cache map[string]k0sv1beta1.Repository
+	mutex sync.RWMutex
+}
+
+// get retrieves a repository configuration by key (repo name for traditional, hostname for OCI)
+// Returns nil if not found.
+func (rc *repositoryCache) get(key string) *k0sv1beta1.Repository {
+	rc.mutex.RLock()
+	defer rc.mutex.RUnlock()
+	repo, ok := rc.cache[key]
+	if !ok {
+		return nil
+	}
+	return &repo
+}
+
+// update replaces the entire cache contents with the provided repositories
+func (rc *repositoryCache) update(repositories []k0sv1beta1.Repository) {
+	// Build a new cache and swap it out under lock
+	newCache := make(map[string]k0sv1beta1.Repository)
+
+	// Populate with new repositories
+	// OCI repos are keyed by hostname, traditional repos by name
+	var repoName string
+	for _, repo := range repositories {
+		if registry.IsOCI(repo.URL) {
+			// Extract hostname from OCI URL and use as key
+			url, err := url.Parse(repo.URL)
+			// This shouldn't really happen at this point but just in case let's log it
+			if err != nil {
+				logrus.WithError(err).Warnf("Invalid repository URL %q, skipping", repo.URL)
+				continue
+			}
+			repoName = url.Host
+		} else {
+			// Traditional repo: use name as key
+			repoName = repo.Name
+		}
+		newCache[repoName] = repo
+	}
+
+	rc.mutex.Lock()
+	rc.cache = newCache
+	defer rc.mutex.Unlock()
+
+}
+
+// ExtensionsController reconciles Helm extension repositories and charts, and
+// keeps the Helm stack up to date as long as leadership is held.
+type ExtensionsController struct {
+	L               *logrus.Entry
+	clients         kubernetes.ClientFactoryInterface
+	leaderElector   leaderelector.Interface
+	stop            func()
+	repositoryCache *repositoryCache
+	helmConfig      value.Latest[*k0sv1beta1.HelmExtensions]
+}
+
+var _ manager.Component = (*ExtensionsController)(nil)
+var _ manager.Reconciler = (*ExtensionsController)(nil)
+
+// NewExtensionsController builds new HelmAddons
+func NewExtensionsController(kubeClientFactory kubernetes.ClientFactoryInterface, leaderElector leaderelector.Interface) *ExtensionsController {
+	return &ExtensionsController{
+		L:               logrus.WithFields(logrus.Fields{"component": "extensions_controller"}),
+		clients:         kubeClientFactory,
+		leaderElector:   leaderElector,
+		repositoryCache: &repositoryCache{},
+	}
+}
+
+const (
+	namespaceToWatch = metav1.NamespaceSystem
+)
+
+// Run runs the extensions controller
+func (ec *ExtensionsController) Reconcile(ctx context.Context, clusterConfig *k0sv1beta1.ClusterConfig) error {
+	helmConfig := clusterConfig.Spec.Extensions.Helm.DeepCopy()
+	if helmConfig == nil {
+		helmConfig = new(k0sv1beta1.HelmExtensions)
+	}
+	ec.helmConfig.Set(helmConfig)
+	return nil
+}
+
+func (ec *ExtensionsController) reconcileConfig(ctx context.Context, stackReconciledOnceCh chan<- struct{}) {
+	var (
+		stackReconciledOnce bool
+		currentRepositories k0sv1beta1.RepositoriesSettings
+		currentCharts       k0sv1beta1.ChartsSettings
+	)
+
+	for {
+		config, configChanged := ec.helmConfig.Peek()
+		leaderStatus, statusChanged := ec.leaderElector.CurrentStatus()
+
+		var retry <-chan time.Time
+		if config != nil && leaderStatus == leaderelection.StatusLeading {
+			if stackReconciledOnce && reflect.DeepEqual(currentRepositories, config.Repositories) && reflect.DeepEqual(currentCharts, config.Charts) {
+				ec.L.Debug("Helm configuration unchanged")
+			} else {
+				ec.L.Debug("Reconciling ", HelmExtensionStackName, " stack")
+
+				// Update repository cache
+				ec.repositoryCache.update(config.Repositories)
+
+				ctx, cancel := context.WithCancelCause(ctx)
+				go func() {
+					select {
+					case <-statusChanged:
+						cancel(leaderelection.ErrLostLead)
+					case <-ctx.Done():
+					}
+				}()
+
+				if ec.reconcileStack(ctx, config.Charts) {
+					stackReconciledOnce = true
+					currentRepositories, currentCharts = config.Repositories, config.Charts
+					ec.L.Info("Reconciled ", HelmExtensionStackName, " stack")
+					if stackReconciledOnceCh != nil {
+						close(stackReconciledOnceCh)
+						stackReconciledOnceCh = nil
+					}
+				} else {
+					if stackReconciledOnce {
+						retry = time.After(wait.Jitter(1*time.Minute, 0.3))
+					} else {
+						retry = time.After(wait.Jitter(7*time.Second, 1))
+					}
+				}
+			}
+		}
+
+		select {
+		case <-configChanged:
+			ec.L.Debug("Processing configuration change")
+
+		case <-statusChanged:
+			stackReconciledOnce = false
+			ec.L.Debug("Processing leader change")
+
+		case <-retry:
+			retry = nil
+			ec.L.Info("Retrying configuration reconciliation")
+
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (ec *ExtensionsController) reconcileStack(ctx context.Context, charts k0sv1beta1.ChartsSettings) bool {
+	var fail bool
+
+	resources, err := applier.ReadUnstructuredDir(static.CRDs, HelmExtensionStackName)
+	if err != nil {
+		ec.L.WithError(err).Error("Failed to fetch Helm CRDs")
+		return false
+	}
+
+	chartTemplate := template.Must(template.New("addon_crd_manifest").Funcs(sprig.TxtFuncMap()).Parse(chartCrdTemplate))
+	for _, chart := range charts {
+		data := struct {
+			*k0sv1beta1.Chart
+			Repository *k0sv1beta1.Repository
+		}{
+			Chart: &chart,
+		}
+
+		// Find matching repository for this chart
+		if repoID := extractRepositoryIdentifier(chart.ChartName); repoID != "" {
+			data.Repository = ec.repositoryCache.get(repoID)
+		}
+
+		var rendered bytes.Buffer
+		if err := chartTemplate.Execute(&rendered, &data); err != nil {
+			ec.L.WithError(err).Error("Failed to render Helm chart manifest ", chart.Name)
+			return false
+		}
+
+		var object unstructured.Unstructured
+		if err := yaml.Unmarshal(rendered.Bytes(), &object.Object); err != nil {
+			ec.L.WithError(err).Error("Failed to render Helm chart manifest ", chart.Name)
+			return false
+		}
+
+		resources = append(resources, &object)
+	}
+
+	if err := applier.ApplyStack(ctx, ec.clients, resources, HelmExtensionStackName); err != nil {
+		fail = true
+		ec.L.WithError(err).Error("Failed to apply ", HelmExtensionStackName, " stack")
+	}
+
+	return !fail
+}
+
+type ChartReconciler struct {
+	client.Client
+	clients         kubernetes.ClientFactoryInterface
+	repositoryCache *repositoryCache
+	leaderElector   leaderelector.Interface
+	L               *logrus.Entry
+}
+
+func (cr *ChartReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+	if !cr.leaderElector.IsLeader() {
+		return reconcile.Result{}, nil
+	}
+	cr.L.Tracef("Got helm chart reconciliation request: %s", req)
+	defer cr.L.Tracef("Finished processing helm chart reconciliation request: %s", req)
+
+	var chartInstance helmv1beta1.Chart
+
+	if err := cr.Get(ctx, req.NamespacedName, &chartInstance); err != nil {
+		if apierrors.IsNotFound(err) {
+			return reconcile.Result{}, nil
+		}
+		return reconcile.Result{}, err
+	}
+
+	if !chartInstance.DeletionTimestamp.IsZero() {
+		cr.L.Debugf("Uninstall reconciliation request: %s", req)
+		// uninstall chart
+		if err := cr.uninstall(ctx, chartInstance); err != nil {
+			if !errors.Is(err, driver.ErrReleaseNotFound) {
+				return reconcile.Result{}, fmt.Errorf("can't uninstall chart: %w", err)
+			}
+
+			cr.L.Debugf("No Helm release found for chart %s, assuming it has already been uninstalled", req)
+		}
+
+		if err := removeFinalizer(ctx, cr.Client, &chartInstance); err != nil {
+			return reconcile.Result{}, fmt.Errorf("while trying to remove finalizer: %w", err)
+		}
+
+		return reconcile.Result{}, nil
+	}
+	cr.L.Debugf("Install or update reconciliation request: %s", req)
+	if err := cr.updateOrInstallChart(ctx, chartInstance); err != nil {
+		return reconcile.Result{}, fmt.Errorf("can't update or install chart: %w", err)
+	}
+
+	cr.L.Debugf("Installed or updated reconciliation request: %s", req)
+	return reconcile.Result{}, nil
+}
+
+func (cr *ChartReconciler) uninstall(ctx context.Context, chart helmv1beta1.Chart) error {
+	// Create ephemeral Helm commands without repository (uninstall doesn't need it)
+	helmCmd, cleanup, err := helm.NewCommands(cr.clients, nil)
+	if err != nil {
+		return fmt.Errorf("can't create Helm commands: %w", err)
+	}
+	defer cleanup()
+
+	if err := helmCmd.UninstallRelease(ctx, chart.Status.ReleaseName, chart.Status.Namespace); err != nil {
+		return fmt.Errorf("can't uninstall release `%s/%s`: %w", chart.Status.Namespace, chart.Status.ReleaseName, err)
+	}
+	return nil
+}
+
+func removeFinalizer(ctx context.Context, c client.Client, chart *helmv1beta1.Chart) error {
+	idx := slices.Index(chart.Finalizers, finalizerName)
+	if idx < 0 {
+		return nil
+	}
+
+	path := fmt.Sprintf("/metadata/finalizers/%d", idx)
+	patch, err := json.Marshal([]struct {
+		Op    string `json:"op"`
+		Path  string `json:"path"`
+		Value string `json:"value,omitempty"`
+	}{
+		{"test", path, finalizerName},
+		{"remove", path, ""},
+	})
+	if err != nil {
+		return err
+	}
+
+	return c.Patch(ctx, chart, client.RawPatch(types.JSONPatchType, patch))
+}
+
+const defaultTimeout = 10 * time.Minute
+
+// loadAndMergeRepositoryConfig loads repository configuration from a secret and merges it
+// with inline configuration. Secret values take precedence over inline values.
+//
+// Supported secret keys:
+//   - url: Repository URL
+//   - username, password: Basic auth credentials
+//   - ca.crt: CA certificate for HTTPS verification
+//   - tls.crt, tls.key: Client certificate/key for mTLS
+//   - insecure: "true" to skip TLS verification
+//
+// Returns the merged repository configuration with in-memory certificate data.
+func (cr *ChartReconciler) loadAndMergeRepositoryConfig(ctx context.Context, chart helmv1beta1.Chart) (*helm.Repository, error) {
+	repoSpec := chart.Spec.Repository
+	if repoSpec == nil {
+		return nil, errors.New("chart has no repository configuration")
+	}
+
+	// If no secret reference, just convert inline config
+	if repoSpec.ConfigFrom == nil || repoSpec.ConfigFrom.SecretRef == nil {
+		return toHelmRepo(chart.Spec.ChartName, repoSpec), nil
+	}
+
+	secretRef := repoSpec.ConfigFrom.SecretRef
+	secretNamespace := secretRef.Namespace
+	if secretNamespace == "" {
+		secretNamespace = chart.Namespace
+	}
+
+	// Fetch the secret
+	var secret corev1.Secret
+	secretKey := types.NamespacedName{
+		Name:      secretRef.Name,
+		Namespace: secretNamespace,
+	}
+	if err := cr.Get(ctx, secretKey, &secret); err != nil {
+		return nil, fmt.Errorf("failed to get repository config secret %s: %w", secretKey, err)
+	}
+
+	// Start with inline configuration
+	repo := toHelmRepo(chart.Spec.ChartName, repoSpec)
+
+	// Override with values from secret (secret takes precedence)
+	if val, ok := secret.Data["url"]; ok && len(val) > 0 {
+		repo.URL = string(val)
+	}
+	if val, ok := secret.Data["username"]; ok && len(val) > 0 {
+		repo.Username = string(val)
+	}
+	if val, ok := secret.Data["password"]; ok && len(val) > 0 {
+		repo.Password = string(val)
+	}
+
+	// Handle certificate data - use in-memory data (no temp files needed here!)
+	// Use standard Kubernetes TLS secret keys (ca.crt, tls.crt, tls.key)
+	if caData, ok := secret.Data["ca.crt"]; ok && len(caData) > 0 {
+		repo.CAData = caData
+		repo.CAFile = "" // Clear file path if data is provided
+	}
+
+	if certData, ok := secret.Data["tls.crt"]; ok && len(certData) > 0 {
+		repo.CertData = certData
+		repo.CertFile = "" // Clear file path if data is provided
+	}
+
+	if keyData, ok := secret.Data["tls.key"]; ok && len(keyData) > 0 {
+		repo.KeyData = keyData
+		repo.KeyFile = "" // Clear file path if data is provided
+	}
+
+	if val, ok := secret.Data["insecure"]; ok && len(val) > 0 {
+		insecure := string(val) == "true"
+		repo.Insecure = &insecure
+	}
+
+	return repo, nil
+}
+
+func (cr *ChartReconciler) updateOrInstallChart(ctx context.Context, chart helmv1beta1.Chart) (err error) {
+	var isInstalling bool
+	var chartRelease release.Releaser
+	var timeout time.Duration
+	timeout, err = time.ParseDuration(chart.Spec.Timeout)
+	if err != nil {
+		cr.L.Tracef("Can't parse `%s` as time.Duration, using default timeout `%s`", chart.Spec.Timeout, defaultTimeout)
+		timeout = defaultTimeout
+	}
+	if timeout == 0 {
+		cr.L.Tracef("Using default timeout `%s`, failed to parse `%s`", defaultTimeout, chart.Spec.Timeout)
+		timeout = defaultTimeout
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		if statusErr := apiretry.RetryOnConflict(apiretry.DefaultRetry, func() error {
+			return cr.updateStatus(ctx, chart, chartRelease, !isInstalling, err)
+		}); statusErr != nil {
+			cr.L.WithError(statusErr).Error("Failed to update status for chart release, give up", chart.Name)
+		}
+	}()
+
+	// Get repository configuration - prefer embedded Repository over cache lookup
+	var repo *helm.Repository
+	chartName := chart.Spec.ChartName
+
+	if chart.Spec.Repository != nil {
+		// Load and merge repository configuration from secret (if configured) and inline fields
+		repo, err = cr.loadAndMergeRepositoryConfig(ctx, chart)
+		if err != nil {
+			err = fmt.Errorf("can't load repository config for chart %q: %w", chartName, err)
+			return
+		}
+
+		// For OCI charts, if URL is not set, extract registry URL from chartName
+		if strings.HasPrefix(chartName, "oci://") && repo.URL == "" {
+			repo.URL = extractOCIRegistryURL(chartName)
+		}
+	} else {
+		// Fall back to extracting repository from chart name and looking it up in cache
+		if k0sRepo, err := cr.extractAndLookupRepository(chartName); err != nil {
+			return fmt.Errorf("can't lookup repository for chart %q: %w", chartName, err)
+		} else if k0sRepo != nil {
+			repo = &helm.Repository{
+				Name:     k0sRepo.Name,
+				URL:      k0sRepo.URL,
+				Username: k0sRepo.Username,
+				Password: k0sRepo.Password,
+				CAFile:   k0sRepo.CAFile,
+				CertFile: k0sRepo.CertFile,
+				KeyFile:  k0sRepo.KeyFile,
+				Insecure: k0sRepo.Insecure,
+			}
+		}
+	}
+
+	// Create ephemeral Helm commands with repository (helm manages tmpDir internally)
+	var helmCmd *helm.Commands
+	var cleanup func()
+	helmCmd, cleanup, err = helm.NewCommands(cr.clients, repo)
+	if err != nil {
+		err = fmt.Errorf("can't create Helm commands for chart %q: %w", chart.GetName(), err)
+		return
+	}
+	defer cleanup()
+
+	if chart.Status.ReleaseName == "" {
+		isInstalling = true
+		status := common.StatusUnknown
+		var version int
+		releaseName := effectiveChartReleaseName(&chart)
+		if chartRelease, err = helmCmd.GetRelease(ctx, releaseName, chart.Spec.Namespace); err == nil {
+			if chartRelease, err := release.NewAccessor(chartRelease); err == nil && chartRelease.Status() != "" {
+				status = common.Status(chartRelease.Status())
+				version = chartRelease.Version()
+			}
+		}
+
+		switch {
+		case status == common.StatusPendingInstall, status == common.StatusFailed, status == common.StatusUninstalling:
+			if err := helmCmd.UninstallRelease(ctx, releaseName, chart.Spec.Namespace); err != nil {
+				return fmt.Errorf("failed to uninstall %q in %q before reinstall: %w", releaseName, chart.Spec.Namespace, err)
+			}
+			cr.L.Info("Uninstalled release ", releaseName, " before reinstall due to status ", status)
+			fallthrough // proceed with installation
+
+		case status == common.StatusUninstalled, err != nil:
+			if err != nil && !errors.Is(err, driver.ErrReleaseNotFound) {
+				return fmt.Errorf("failed to get release: %w", err)
+			}
+
+			// new chartRelease
+			cr.L.Tracef("Start update or install %s", chartName)
+			chartRelease, err = helmCmd.InstallChart(ctx,
+				chartName,
+				chart.Spec.Version,
+				releaseName,
+				chart.Spec.Namespace,
+				chart.Spec.YamlValues(),
+				timeout,
+				status == common.StatusUninstalled,
+			)
+			if err != nil {
+				if !errors.Is(err, driver.ErrReleaseExists) /* don't uninstall if existing */ {
+					select {
+					case <-ctx.Done():
+						err = fmt.Errorf("%w (%w)", err, context.Cause(ctx))
+					default:
+						if uninstallErr := helmCmd.UninstallRelease(ctx, releaseName, chart.Spec.Namespace); uninstallErr != nil {
+							err = fmt.Errorf("an error occurred while uninstalling: %w; original install error: %w", uninstallErr, err)
+						}
+					}
+				}
+
+				err = fmt.Errorf("can't reconcile installation for %q: %w", chart.GetName(), err)
+				return
+			}
+
+		default:
+			// Note: The deferred status update may persist an updated chart
+			// status based on chartRelease and the returned error. During the
+			// next reconciliation, execution may be routed to the upgrade
+			// branch instead of the install branch.
+			isInstalling = false
+			return fmt.Errorf("unsupported status %s in release version %d", status, version)
+		}
+	} else {
+		if !cr.chartNeedsUpgrade(chart) {
+			return nil
+		}
+		// update
+		chartRelease, err = helmCmd.UpgradeChart(ctx,
+			chartName,
+			chart.Spec.Version,
+			chart.Status.ReleaseName,
+			chart.Status.Namespace,
+			chart.Spec.YamlValues(),
+			timeout,
+			chart.Spec.ShouldForceUpgrade(),
+		)
+		if err != nil {
+			err = fmt.Errorf("can't reconcile upgrade for %q: %w", chart.GetName(), err)
+			return
+		}
+	}
+	if statusErr := apiretry.RetryOnConflict(apiretry.DefaultRetry, func() error {
+		return cr.updateStatus(ctx, chart, chartRelease, true, nil)
+	}); statusErr != nil {
+		cr.L.WithError(statusErr).Error("Failed to update status for chart release, give up", chart.Name)
+	}
+	return nil
+}
+
+// extractAndLookupRepository extracts the repository name or OCI hostname from chartName
+// and looks it up in the repository cache. Returns a pointer to the repository config or nil
+// if no repository configuration is needed (e.g., local path charts, OCI charts without auth).
+func (cr *ChartReconciler) extractAndLookupRepository(chartName string) (*k0sv1beta1.Repository, error) {
+	repoID := extractRepositoryIdentifier(chartName)
+
+	if repoID == "" {
+		// Local path or invalid format
+		if filepath.IsAbs(chartName) || strings.HasPrefix(chartName, ".") {
+			return nil, nil // Local chart, no repo needed
+		}
+		// Traditional chart without slash - error
+		return nil, fmt.Errorf("invalid chart name %q: expected format 'repository/chart' for non-OCI charts", chartName)
+	}
+
+	// For OCI, missing repo is okay (anonymous access)
+	if registry.IsOCI(chartName) {
+		return cr.repositoryCache.get(repoID), nil
+	}
+
+	// For traditional, missing repo is an error
+	cachedRepo := cr.repositoryCache.get(repoID)
+	if cachedRepo == nil {
+		return nil, fmt.Errorf("repository '%s' not found in cluster configuration", repoID)
+	}
+	return cachedRepo, nil
+}
+
+// extractRepositoryIdentifier extracts the repository identifier from a chart name.
+// For OCI charts, returns the hostname. For traditional charts, returns the repo name.
+//
+// Examples:
+//   - "oci://ghcr.io/org/chart" → "ghcr.io"
+//   - "oci://registry:8080/chart" → "registry:8080"
+//   - "myrepo/mychart" → "myrepo"
+//   - "/path/to/chart.tgz" → ""
+//   - "./chart" → ""
+//
+// Returns empty string for local paths or if no identifier can be extracted.
+func extractRepositoryIdentifier(chartName string) string {
+	// Local paths don't have repository identifiers
+	if filepath.IsAbs(chartName) || strings.HasPrefix(chartName, ".") {
+		return ""
+	}
+
+	// OCI charts: extract hostname from URL
+	if registry.IsOCI(chartName) {
+		if chartURL, err := url.Parse(chartName); err == nil {
+			return chartURL.Host
+		}
+		return ""
+	}
+
+	// Traditional charts: extract repo name before first slash
+	if repoName, _, found := strings.Cut(chartName, "/"); found {
+		return repoName
+	}
+
+	return ""
+}
+
+// extractOCIRegistryURL extracts the base registry URL from an OCI chart name.
+//
+// Examples:
+//   - "oci://ghcr.io/user/charts/mychart" → "oci://ghcr.io"
+//   - "oci://registry:8080/chart" → "oci://registry:8080"
+//   - "myrepo/chart" → "" (not OCI)
+//
+// Returns empty string for non-OCI charts.
+func extractOCIRegistryURL(chartName string) string {
+	if !strings.HasPrefix(chartName, "oci://") {
+		return ""
+	}
+
+	chartURL, err := url.Parse(chartName)
+	if err != nil || chartURL.Host == "" {
+		return ""
+	}
+
+	return "oci://" + chartURL.Host
+}
+
+func (cr *ChartReconciler) chartNeedsUpgrade(chart helmv1beta1.Chart) bool {
+	return chart.Status.Namespace != chart.Spec.Namespace ||
+		chart.Status.ReleaseName != effectiveChartReleaseName(&chart) ||
+		chart.Status.Version != chart.Spec.Version ||
+		chart.Status.Error != "" ||
+		chart.Status.ValuesHash != hashChartValues(&chart)
+}
+
+func effectiveChartReleaseName(chart *helmv1beta1.Chart) string {
+	return cmp.Or(chart.Spec.ReleaseName, chart.Name)
+}
+
+func hashChartValues(chart *helmv1beta1.Chart) string {
+	h := sha256.New()
+	h.Write([]byte(effectiveChartReleaseName(chart) + chart.Spec.Values))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// updateStatus updates the status of the chart with the given release information. This function
+// starts by fetching an updated version of the chart from the api as the install may take a while
+// to complete and the chart may have been updated in the meantime. If returns the error returned
+// by the Update operation. Moreover, if the chart has indeed changed in the meantime we already
+// have an event for it so we will see it again soon.
+func (cr *ChartReconciler) updateStatus(ctx context.Context, chart helmv1beta1.Chart, chartReleaser release.Releaser, installed bool, err error) error {
+	nsn := types.NamespacedName{Namespace: chart.Namespace, Name: chart.Name}
+	var updchart helmv1beta1.Chart
+	if err := cr.Get(ctx, nsn, &updchart); err != nil {
+		return fmt.Errorf("can't get updated version of chart %s: %w", chart.Name, err)
+	}
+	chart.Spec.YamlValues() // XXX what is this function for ?
+	if chartReleaser != nil {
+		chartRelease, err := release.NewAccessor(chartReleaser)
+		if err != nil {
+			return fmt.Errorf("failed to access updated release of chart %s: %w", nsn, err)
+		}
+		chartAccessor, err := charts.NewAccessor(chartRelease.Chart())
+		if err != nil {
+			return fmt.Errorf("failed to access updated chart %s: %w", nsn, err)
+		}
+		if installed {
+			updchart.Status.ReleaseName = chartRelease.Name()
+		}
+		metadata := chartAccessor.MetadataAsMap()
+		updchart.Status.Version = fmt.Sprint(cmp.Or(metadata["Version"], ""))
+		updchart.Status.AppVersion = fmt.Sprint(cmp.Or(metadata["AppVersion"], ""))
+		updchart.Status.Revision = int64(chartRelease.Version())
+		updchart.Status.Namespace = chartRelease.Namespace()
+	}
+	updchart.Status.Updated = time.Now().String()
+	updchart.Status.Error = ""
+	if err != nil {
+		updchart.Status.Error = err.Error()
+	}
+	updchart.Status.ValuesHash = hashChartValues(&chart)
+	if updErr := cr.Client.Status().Update(ctx, &updchart); updErr != nil {
+		cr.L.WithError(updErr).Error("Failed to update status for chart release", chart.Name)
+		return updErr
+	}
+	return nil
+}
+
+const chartCrdTemplate = `
+---
+apiVersion: helm.k0sproject.io/v1beta1
+kind: Chart
+metadata:
+  name: k0s-addon-chart-{{ .Name }}
+  namespace: ` + metav1.NamespaceSystem + `
+  finalizers:
+    - ` + finalizerName + `
+spec:
+  chartName: {{ .ChartName }}
+  releaseName: {{ .Name }}
+  timeout: {{ .Timeout.Duration }}
+  values: |
+{{ .Values | nindent 4 }}
+  version: {{ .Version }}
+  namespace: {{ .TargetNS }}
+{{- if ne .ForceUpgrade nil }}
+  forceUpgrade: {{ .ForceUpgrade }}
+{{- end }}
+
+{{- if .Repository }}
+  repository:
+{{- if .Repository.URL }}
+    url: {{ .Repository.URL }}
+{{- end }}
+{{- if .Repository.Username }}
+    username: {{ .Repository.Username }}
+{{- end }}
+{{- if .Repository.Password }}
+    password: {{ .Repository.Password }}
+{{- end }}
+{{- if .Repository.CAFile }}
+    caFile: {{ .Repository.CAFile }}
+{{- end }}
+{{- if .Repository.CertFile }}
+    certFile: {{ .Repository.CertFile }}
+{{- end }}
+{{- if .Repository.KeyFile }}
+    keyFile: {{ .Repository.KeyFile }}
+{{- end }}
+{{- if ne .Repository.Insecure nil }}
+    insecure: {{ .Repository.Insecure }}
+{{- end }}
+{{- end }}
+`
+
+const finalizerName = "helm.k0sproject.io/uninstall-helm-release"
+
+// Init
+func (ec *ExtensionsController) Init(_ context.Context) error {
+	return nil
+}
+
+// Start
+func (ec *ExtensionsController) Start(context.Context) error {
+	ec.L.Debug("Starting")
+
+	mgr, err := ec.instantiateManager()
+	if err != nil {
+		return fmt.Errorf("can't instantiate controller-runtime manager: %w", err)
+	}
+
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+	stackReconciledOnce := make(chan struct{})
+
+	wg.Go(func() { ec.reconcileConfig(ctx, stackReconciledOnce) })
+	wg.Go(func() {
+		leaderelection.RunLeaderTasks(ctx, ec.leaderElector.CurrentStatus, func(ctx context.Context) {
+			select {
+			case <-stackReconciledOnce:
+			case <-ctx.Done():
+				return
+			}
+
+			ec.L.Info("Running controller-runtime manager")
+			if err := mgr.Start(ctx); err != nil {
+				ec.L.WithError(err).Error("Failed to run controller-runtime manager")
+			} else {
+				ec.L.Info("Controller-runtime manager exited")
+			}
+		})
+
+	})
+
+	ec.stop = func() {
+		cancel()
+		wg.Wait()
+	}
+
+	return nil
+}
+
+func (ec *ExtensionsController) instantiateManager() (crman.Manager, error) {
+	clientConfig, err := ec.clients.GetRESTConfig()
+	if err != nil {
+		return nil, fmt.Errorf("can't build controller-runtime controller for helm extensions: %w", err)
+	}
+
+	// Create a scheme with both k0s types and core Kubernetes types (needed for Secret access)
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+	if err := k0sscheme.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+
+	mgr, err := controllerruntime.NewManager(clientConfig, crman.Options{
+		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: "0",
+		},
+		Logger: logrusr.New(ec.L),
+		Controller: ctrlconfig.Controller{
+			MaxConcurrentReconciles: 10,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("can't build controller-runtime controller for helm extensions: %w", err)
+	}
+
+	if err := builder.
+		ControllerManagedBy(mgr).
+		Named("chart").
+		For(&helmv1beta1.Chart{},
+			builder.WithPredicates(predicate.And(
+				predicate.GenerationChangedPredicate{},
+				predicate.NewPredicateFuncs(func(object client.Object) bool {
+					return object.GetNamespace() == namespaceToWatch
+				}),
+			),
+			),
+		).
+		Complete(&ChartReconciler{
+			Client:          mgr.GetClient(),
+			clients:         ec.clients,
+			repositoryCache: ec.repositoryCache,
+			leaderElector:   ec.leaderElector, // TODO: drop in favor of controller-runtime lease manager?
+			L:               ec.L.WithField("extensions_type", "helm"),
+		}); err != nil {
+		return nil, fmt.Errorf("can't build controller-runtime controller for helm extensions: %w", err)
+	}
+	return mgr, nil
+}
+
+// Stop
+func (ec *ExtensionsController) Stop() error {
+	if ec.stop != nil {
+		ec.stop()
+	}
+	ec.L.Debug("Stopped extensions controller")
+	return nil
+}
+
+func toHelmRepo(chartName string, r *helmv1beta1.RepositorySpec) *helm.Repository {
+	return &helm.Repository{
+		Name:     extractRepositoryIdentifier(chartName),
+		URL:      r.URL,
+		Username: r.Username,
+		Password: r.Password,
+		CAFile:   r.CAFile,
+		CertFile: r.CertFile,
+		KeyFile:  r.KeyFile,
+		Insecure: r.Insecure,
+	}
+}

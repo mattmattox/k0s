@@ -6,40 +6,46 @@ export GOOS
 TARGET_OS ?= linux
 export TARGET_OS
 
+DOCKER ?= docker
+
+# https://reproducible-builds.org/docs/source-date-epoch/#makefile
+# https://reproducible-builds.org/docs/source-date-epoch/#git
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct || date -u +%s)
+
 bindir = staging/${TARGET_OS}/bin
-posix_bins = runc kubelet containerd containerd-shim containerd-shim-runc-v1 containerd-shim-runc-v2 kube-apiserver kube-scheduler kube-controller-manager etcd kine konnectivity-server
-windows_bins = kubelet.exe kube-proxy.exe
-buildmode = docker
-
-
+posix_bins = runc kubelet containerd containerd-shim-runc-v2 kube-apiserver kube-scheduler kube-controller-manager etcd kine konnectivity-server xtables-legacy-multi xtables-nft-multi keepalived
+windows_bins = kubelet.exe containerd.exe containerd-shim-runhcs-v1.exe
 
 ifeq ($(TARGET_OS),windows)
 bins = ${windows_bins}
+# suffix .exe is added to the binaries in the original build pipelines
+containerd_bins = containerd containerd-shim-runhcs-v1
+kubernetes_bins = kubelet kube-proxy
 else
+containerd_bins = containerd containerd-shim-runc-v2
+kubernetes_bins = kubelet kube-apiserver kube-scheduler kube-controller-manager
 bins = ${posix_bins}
 endif
+
+.DELETE_ON_ERROR:
 
 .PHONY: all
 all: $(addprefix $(bindir)/, $(bins))
 
 .PHONY: clean
+clean: IID_FILES = .docker-image.*.stamp
 clean:
 	for i in .container.*; do \
-		if [ -f $$i ]; then \
-			docker rm $$(cat $$i) && rm $$i; \
-		fi; \
+	  [ -f "$$i" ] || continue; \
+	  $(DOCKER) rm -- "$$(cat -- "$$i")"; \
+	  rm -- "$$i"; \
 	done
-	for i in .docker-image.*; do \
-		if [ -f $$i ]; then \
-			docker rmi -f k0sbuild$$(basename $$i .stamp) && rm $$i;\
-		fi; \
-	done
-	rm -rf staging .tmp/* *.tmp
+	$(clean-iid-files)
+	rm -rf staging
+	@echo 'cleaned up; you may want to run `docker system prune` in order to free dangling resources ...'
 
 $(bindir):
 	mkdir -p $@
-
-ifeq ($(buildmode),docker)
 
 dockerfiles := $(wildcard */Dockerfile)
 images := $(patsubst %/Dockerfile,%,$(dockerfiles))
@@ -48,80 +54,61 @@ containers: $(images:%=.container.%)
 docker-images: $(images:%=.docker-image.%.stamp)
 
 $(bindir)/runc: .container.runc
-$(bindir)/containerd $(bindir)/containerd-shim $(bindir)/containerd-shim-runc-v1 $(bindir)/containerd-shim-runc-v2: .container.containerd
+$(bindir)/containerd $(bindir)/containerd-shim-runc-v2: .container.containerd
 $(bindir)/etcd: .container.etcd
 $(bindir)/kine: .container.kine
 $(bindir)/konnectivity-server: .container.konnectivity
 $(bindir)/kubelet $(bindir)/kube-apiserver $(bindir)/kube-scheduler $(bindir)/kube-controller-manager: .container.kubernetes
+$(bindir)/xtables-legacy-multi: .container.iptables
+$(bindir)/xtables-nft-multi: .container.iptables
+$(bindir)/keepalived: .container.keepalived
 
-$(bindir)/kubelet.exe $(bindir)/kube-proxy.exe: .container.kubernetes.windows
+$(bindir)/kubelet.exe: .container.kubernetes.windows
+$(bindir)/containerd.exe $(bindir)/containerd-shim-runhcs-v1.exe: .container.containerd.windows
 
 $(addprefix $(bindir)/, $(bins)): | $(bindir)
-	docker export $$(cat $<) | tar -C $(dir $(bindir)) -xv bin/$(notdir $@) && touch $@
+	tardir=$$(mktemp -d -- '.$(notdir $@).tmp.XXXXXX') \
+	  && trap "rm -rf -- $$tardir" INT EXIT \
+	  && $(DOCKER) export "$$(cat $<)" \
+	  | tar -C "$$tardir" -x bin/$(notdir $@) \
+	  && touch -c -- "$$tardir"/bin/$(notdir $@) \
+	  && mv "$$tardir"/bin/$(notdir $@) $@
+
+build_docker_container = \
+	rm -f -- '$@'; \
+	$(DOCKER) create --cidfile='$@' --entrypoint=/dev/null '$(shell cat -- $<)'
 
 .container.%: .docker-image.%.stamp
-	docker create k0sbuild$(basename $<) > $@.tmp
-	mv $@.tmp $@
+	$(build_docker_container)
 
 .container.%.windows: .docker-image.%.windows.stamp
-	docker create k0sbuild$(basename $<) > $@.tmp
-	mv $@.tmp $@
+	$(build_docker_container)
+
+build_docker_image = \
+	$(DOCKER) build --progress=plain --iidfile '$@' -t k0sbuild$(basename $@):latest \
+	  --build-arg BUILDKIT_DOCKERFILE_CHECK=skip=InvalidDefaultArgInFrom \
+	  --build-arg TARGET_OS=$(if $(findstring .windows.stamp,$@),windows,linux) \
+	  --build-arg CONTAINERD_BINS="$(containerd_bins)" \
+	  --build-arg KUBERNETES_BINS="$(kubernetes_bins)" \
+	  --build-arg VERSION=$($(patsubst %/Dockerfile,%,$<)_version) \
+	  --build-arg REVISION=$($(patsubst %/Dockerfile,%,$<)_revision) \
+	  --build-arg SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH) \
+	  --build-arg BUILDIMAGE=$($(patsubst %/Dockerfile,%,$<)_buildimage) \
+	  --build-arg BUILD_GO_TAGS=$($(patsubst %/Dockerfile,%,$<)_build_go_tags) \
+	  --build-arg BUILD_GO_CGO_ENABLED=$($(patsubst %/Dockerfile,%,$<)_build_go_cgo_enabled) \
+	  --build-arg BUILD_GO_CGO_CFLAGS='$($(patsubst %/Dockerfile,%,$<)_build_go_cgo_cflags)' \
+	  --build-arg BUILD_SHIM_GO_CGO_ENABLED=$($(patsubst %/Dockerfile,%,$<)_build_shim_go_cgo_enabled) \
+	  --build-arg BUILD_GO_FLAGS=$($(patsubst %/Dockerfile,%,$<)_build_go_flags) \
+	  --build-arg BUILD_GO_LDFLAGS='$($(patsubst %/Dockerfile,%,$<)_build_go_ldflags) $($(patsubst %/Dockerfile,%,$<)_build_go_ldflags_extra)' \
+	  --build-arg BUILD_CFLAGS='$($(patsubst %/Dockerfile,%,$<)_build_cflags)' \
+	  --build-arg BUILD_LDFLAGS='$($(patsubst %/Dockerfile,%,$<)_build_ldflags)' \
+	  --build-arg BUILD_CONFIGURE_FLAGS='$($(patsubst %/Dockerfile,%,$<)_build_configure_flags)' \
+	  -- $(dir $<)
 
 .docker-image.%.stamp: %/Dockerfile Makefile.variables
-	docker build -t k0sbuild$(basename $@) \
-		--build-arg VERSION=$($(patsubst %/Dockerfile,%,$<)_version) \
-		--build-arg BUILDIMAGE=$($(patsubst %/Dockerfile,%,$<)_buildimage) \
-		--build-arg BUILD_GO_TAGS=$($(patsubst %/Dockerfile,%,$<)_build_go_tags) \
-		--build-arg BUILD_GO_CGO_ENABLED=$($(patsubst %/Dockerfile,%,$<)_build_go_cgo_enabled) \
-		--build-arg BUILD_SHIM_GO_CGO_ENABLED=$($(patsubst %/Dockerfile,%,$<)_build_shim_go_cgo_enabled) \
-		--build-arg BUILD_GO_FLAGS=$($(patsubst %/Dockerfile,%,$<)_build_go_flags) \
-		--build-arg BUILD_GO_LDFLAGS=$($(patsubst %/Dockerfile,%,$<)_build_go_ldflags) \
-		--build-arg BUILD_GO_LDFLAGS_EXTRA=$($(patsubst %/Dockerfile,%,$<)_build_go_ldflags_extra) \
-		-f $< .
-	touch $@
+	$(build_docker_image)
 
-.docker-image.%.windows.stamp: %/Dockerfile.windows Makefile.variables
-	docker build -t k0sbuild$(basename $@) \
-		--build-arg VERSION=$($(patsubst %/Dockerfile.windows,%,$<)_version) \
-		--build-arg BUILDIMAGE=$($(patsubst %/Dockerfile.windows,%,$<)_buildimage) \
-		-f $< .
-	touch $@
+.docker-image.%.windows.stamp: %/Dockerfile Makefile.variables
+	$(build_docker_image)
 
-else
-# fetch official binaires
-#
-curl = curl --silent -L
-
-runc_url = https://github.com/opencontainers/runc/releases/download/v$(runc_version)/runc.$(arch)
-kubelet_url = https://storage.googleapis.com/kubernetes-release/release/v$(kubernetes_version)/bin/linux/$(arch)/kubelet
-kube-apiserver_url = https://storage.googleapis.com/kubernetes-release/release/v$(kubernetes_version)/bin/linux/$(arch)/kube-apiserver
-kube-scheduler_url = https://storage.googleapis.com/kubernetes-release/release/v$(kubernetes_version)/bin/linux/$(arch)/kube-scheduler
-kube-controller-manager_url = https://storage.googleapis.com/kubernetes-release/release/v$(kubernetes_version)/bin/linux/$(arch)/kube-controller-manager
-kine_url = https://github.com/k3s-io/kine/releases/download/v$(kine_version)/kine-amd64
-
-containerd_url = https://github.com/containerd/containerd/releases/download/v$(containerd_version)/containerd-$(containerd_version)-linux-$(arch).tar.gz
-etcd_url = https://github.com/etcd-io/etcd/releases/download/v$(etcd_version)/etcd-v$(etcd_version)-linux-$(arch).tar.gz
-
-containerd_extract = bin/containerd bin/containerd-shim bin/containerd-shim-runc-v1 bin/containerd-shim-runc-v2
-etcd_extract = etcd-v$(etcd_version)-linux-$(arch)/etcd
-
-tmpdir ?= .tmp
-arch = amd64
-
-
-$(addprefix $(bindir)/, runc kubelet kube-apiserver kube-scheduler kube-controller-manager kine): | $(bindir)
-	$(curl) -o $@ $($(notdir $@)_url)
-
-$(addprefix $(bindir)/, containerd etcd): | $(bindir)
-	$(curl) $($(notdir $@)_url) | tar -C $(bindir)/ -zxv --strip-components=1 $($(notdir $@)_extract)
-
-# konnectivity does not ship precompiled binaries so lets build it from source
-$(bindir)/konnectivity-server: | $(bindir)
-	if ! [ -d $(tmpdir)/apiserver-network-proxy ]; then \
-		mkdir -p $(tmpdir) \
-			&& cd $(tmpdir) \
-			&& git clone -b v$(konnectivity_version) --depth=1 https://github.com/kubernetes-sigs/apiserver-network-proxy.git; \
-	fi
-	cd $(tmpdir)/apiserver-network-proxy && make bin/proxy-server && cp bin/proxy-server $(CURDIR)/$@
-
-endif
+.docker-image.kubernetes.stamp .docker-image.kubernetes.windows.stamp: $(wildcard kubernetes/patches/*)

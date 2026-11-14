@@ -1,0 +1,158 @@
+name: Go lint
+
+on:
+  push:
+    branches:
+      - main
+      - release-*
+    paths-ignore:
+      - "**.md"
+      - .github/**
+      - "!.github/workflows/lint.yaml"
+      - docs/**
+      - LICENSE
+      - mkdocs.yml
+      - renovate.json
+  pull_request:
+    branches:
+      - main
+      - release-*
+    paths-ignore:
+      - "**.md"
+      - .github/**
+      - "!.github/workflows/lint.yaml"
+      - docs/**
+      - LICENSE
+      - mkdocs.yml
+      - renovate.json
+
+env:
+  MAKEFLAGS: -j
+  EMBEDDED_BINS_BUILDMODE: none
+
+permissions:
+  contents: read
+
+jobs:
+  lint-go:
+    strategy:
+      fail-fast: false
+      matrix:
+        target-os: [linux, windows, darwin]
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      DOCKER: "${{ matrix.target-os == 'linux' && 'docker' || ''}}"
+      LOCALAPPDATA: ${{ github.workspace }}\build\cache
+
+    name: Lint Go
+    runs-on: >-
+      ${{
+           matrix.target-os == 'windows' && 'windows-2025'
+        || matrix.target-os == 'darwin'  && 'macos-15'
+        || 'ubuntu-24.04'
+      }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Prepare build environment
+        run: .github/workflows/prepare-build-env.sh
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: matrix.target-os != 'linux'
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Cache golangci-lint cache
+        id: cache-golangci
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: "lint-${{ matrix.target-os }}-amd64-golangci-${{ env.GOLANGCI_LINT_VERSION }}-go-${{ env.GO_VERSION }}-${{ github.sha }}"
+          restore-keys: |
+            lint-${{ matrix.target-os }}-amd64-golangci-${{ env.GOLANGCI_LINT_VERSION }}-go-${{ env.GO_VERSION }}-
+          path: |
+            build/cache/go/build
+            build/cache/golangci-lint
+
+      - name: Register golangci-lint problem matchers
+        run: echo "::add-matcher::.github/golangci-lint-problem-matchers.json"
+
+      - name: Run linter
+        env:
+          CACHE_HIT_GOLANGCI: "${{ steps.cache-golangci.outputs.cache-hit }}"
+        run: |
+          if [ -n "$CACHE_HIT_GOLANGCI" ]; then
+            echo Preparing golangci-lint cache
+            touch -t "$(TZ=UTC+24 date +%Y%m%d%H%M.%S)" build/cache/_cache_sentinel
+            find build/cache/go/build build/cache/golangci-lint -type f \( -name '*-a' -o -name '*-d' \) -exec touch -r build/cache/_cache_sentinel {} +
+          fi
+
+          #shellcheck disable=SC2086 # MAKE_EXTRA_ARGS intentionally expands to multiple arguments
+          make lint-go $MAKE_EXTRA_ARGS
+
+          if [ -n "$CACHE_HIT_GOLANGCI" ]; then
+            echo Trimming golangci-lint cache
+            find build/cache/go/build build/cache/golangci-lint -type f \( -name '*-a' -o -name '*-d' \) -not -newer build/cache/_cache_sentinel -delete
+          fi
+
+  lint-codegen:
+    name: Lint generated code
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          preserve-credentials: false
+
+      - name: Prepare build environment
+        run: .github/workflows/prepare-build-env.sh
+
+      - name: Restore Go cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: "build-k0s-linux-amd64-gocache-go${{ env.GO_VERSION }}-${{ github.sha }}"
+          restore-keys: |
+            build-k0s-linux-amd64-gocache-go${{ env.GO_VERSION }}-
+          path: build/cache/go/build
+
+      - name: Check go.mod/go.sum to be consistent
+        run: make --always-make go.sum && git diff --exit-code
+
+      - name: Check generated code to be consistent
+        run: make codegen && git diff --exit-code
+
+      - name: Check copyright headers
+        run: WHAT=code make lint-copyright
+
+  validate-os-tests:
+    name: Validate OS tests
+    runs-on: ubuntu-24.04
+
+    env:
+      TOFU_VERSION: 1.13.9 # renovate: datasource=github-releases depName=opentofu/opentofu
+
+    defaults:
+      run:
+        working-directory: hack/ostests
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: hack/ostests
+          persist-credentials: false
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - run: tofu fmt -check
+      - run: tofu init
+      - run: tofu validate -no-color

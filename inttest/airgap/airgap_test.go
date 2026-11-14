@@ -1,31 +1,24 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package airgap
 
 import (
-	"context"
-	"os"
+	"fmt"
 	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/suite"
-	"github.com/weaveworks/footloose/pkg/config"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"github.com/k0sproject/k0s/inttest/common"
+	"github.com/k0sproject/k0s/pkg/airgap"
+	"github.com/k0sproject/k0s/pkg/apis/k0s/v1beta1"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/client-go/kubernetes"
+
+	"github.com/containerd/platforms"
+
+	"github.com/stretchr/testify/suite"
 )
 
 const k0sConfig = `
@@ -35,78 +28,82 @@ spec:
 `
 
 type AirgapSuite struct {
-	common.FootlooseSuite
+	common.BootlooseSuite
 }
 
 func (s *AirgapSuite) TestK0sGetsUp() {
+	ctx := s.Context()
+	err := (&common.Airgap{
+		SSH:  s.SSH,
+		Logf: s.T().Logf,
+	}).LockdownMachines(ctx,
+		s.ControllerNode(0), s.WorkerNode(0),
+	)
+	s.Require().NoError(err)
+
 	s.PutFile(s.ControllerNode(0), "/tmp/k0s.yaml", k0sConfig)
 	s.NoError(s.InitController(0, "--config=/tmp/k0s.yaml"))
 	s.NoError(s.RunWorkers(`--labels="k0sproject.io/foo=bar"`, `--kubelet-extra-args="--address=0.0.0.0 --event-burst=10 --image-gc-high-threshold=100"`))
 
-	kc, err := s.KubeClient(s.ControllerNode(0))
-	s.NoError(err)
+	restConfig, err := s.GetKubeConfig(s.ControllerNode(0))
+	s.Require().NoError(err)
+	kc, err := kubernetes.NewForConfig(restConfig)
+	s.Require().NoError(err)
 
 	err = s.WaitForNodeReady(s.WorkerNode(0), kc)
 	s.NoError(err)
 
-	labels, err := s.GetNodeLabels(s.WorkerNode(0), kc)
-	s.NoError(err)
-	s.Equal("bar", labels["k0sproject.io/foo"])
+	if labels, err := s.GetNodeLabels(s.WorkerNode(0), kc); s.NoError(err) {
+		s.Equal("bar", labels["k0sproject.io/foo"])
+	}
 
-	pods, err := kc.CoreV1().Pods("kube-system").List(context.TODO(), v1.ListOptions{
-		Limit: 100,
+	s.Require().NoError(common.WaitForKubeRouterReady(ctx, kc), "While waiting for kube-router to become ready")
+	s.Require().NoError(common.WaitForCoreDNSReady(ctx, kc), "While waiting for CoreDNS to become ready")
+	s.Require().NoError(common.VerifyKonnectivityMesh(ctx, restConfig, kc, s.T(), uint(s.ControllerCount), uint(s.WorkerCount)), "While verifying konnectivity mesh")
+
+	// At that moment we can assume that all pods have at least started
+	// We're interested only in image pull events
+	events, err := kc.CoreV1().Events(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+		FieldSelector: fields.AndSelectors(
+			fields.OneTermEqualSelector("involvedObject.kind", "Pod"),
+			fields.OneTermEqualSelector("reason", "Pulled"),
+		).String(),
 	})
-	s.NoError(err)
+	s.Require().NoError(err)
 
-	podCount := len(pods.Items)
-
-	s.T().Logf("found %d pods in kube-system", podCount)
-	s.Greater(podCount, 0, "expecting to see few pods in kube-system namespace")
-
-	s.T().Log("waiting to see kube-router pods ready")
-	s.NoError(common.WaitForKubeRouterReady(kc), "kube-router did not start")
-
-	// at that moment we can assume that all pods has at least started
-	events, err := kc.CoreV1().Events("kube-system").List(context.TODO(), v1.ListOptions{
-		Limit: 100,
-	})
-	s.NoError(err)
-	imagesUsed := 0
-	var pulledImagesMessages []string
 	for _, event := range events.Items {
-		if event.Source.Component == "kubelet" && event.Reason == "Pulled" {
-			// We're interested only in image pull events
-			s.T().Logf(event.Message)
-			if strings.Contains(event.Message, "already present on machine") {
-				imagesUsed++
-			}
-			if strings.Contains(event.Message, "Pulling image") {
-				pulledImagesMessages = append(pulledImagesMessages, event.Message)
-			}
+		if !strings.HasSuffix(event.Message, "already present on machine and can be accessed by the pod") {
+			s.Fail("Unexpected Pulled event", event.Message)
+		} else {
+			s.T().Log("Observed Pulled event:", event.Message)
 		}
 	}
-	s.T().Logf("Used %d images from airgap bundle", imagesUsed)
-	if len(pulledImagesMessages) > 0 {
-		s.T().Logf("Image pulls messages")
-		for _, message := range pulledImagesMessages {
-			s.T().Logf(message)
-		}
-		s.Fail("Require all images be installed from bundle")
+
+	// Check that all the images have io.cri-containerd.pinned=pinned label and that images cannot be pulled in airgap environment
+	ssh, err := s.SSH(ctx, s.WorkerNode(0))
+	s.Require().NoError(err)
+	defer ssh.Disconnect()
+	for _, i := range airgap.GetImageURIs(airgap.TargetEnv{
+		Spec:     v1beta1.DefaultClusterSpec(),
+		Platform: platforms.DefaultSpec(),
+	}, true) {
+		output, err := ssh.ExecWithOutput(ctx, fmt.Sprintf(`k0s ctr i ls "name==%s"`, i))
+		s.Require().NoError(err)
+		s.Require().Containsf(output, "io.cri-containerd.pinned=pinned", "expected %s image to have io.cri-containerd.pinned=pinned label", i)
+
+		_, err = ssh.ExecWithOutput(ctx, `k0s ctr pull `+i)
+		s.Require().Errorf(err, "expected k0s ctr pull %s to fail in airgap environment", i)
+
 	}
 }
 
 func TestAirgapSuite(t *testing.T) {
 	s := AirgapSuite{
-		common.FootlooseSuite{
+		common.BootlooseSuite{
 			ControllerCount: 1,
 			WorkerCount:     1,
-			ExtraVolumes: []config.Volume{
-				{
-					Type:        "bind",
-					Source:      os.Getenv("K0S_IMAGES_BUNDLE"),
-					Destination: "/var/lib/k0s/images/bundle.tar",
-				},
-			},
+
+			AirgapImageBundleMountPoints: []string{"/var/lib/k0s/images/bundle.tar"},
 		},
 	}
 	suite.Run(t, &s)

@@ -1,50 +1,55 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2020 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package applier
 
 import (
-	"bytes"
 	"context"
-	"io/ioutil"
-	"path"
+	"fmt"
+	"os"
 	"path/filepath"
 
-	"k8s.io/client-go/util/retry"
-
-	"github.com/k0sproject/k0s/pkg/kubernetes"
-	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/util/yaml"
-	"k8s.io/client-go/discovery"
-	"k8s.io/client-go/dynamic"
+	"k8s.io/cli-runtime/pkg/resource"
+
+	"github.com/sirupsen/logrus"
 )
+
+// manifestFilePattern is the glob pattern that all applicable manifest files need to match.
+const manifestFilePattern = "*.yaml"
+
+func FindManifestFilesInDir(dir string) ([]string, error) {
+	// Don't use filepath.Glob directly, as that will swallow I/O errors.
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	matches := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if match, err := filepath.Match(manifestFilePattern, entry.Name()); err != nil {
+			return nil, err
+		} else if !match {
+			continue
+		}
+
+		matches = append(matches, filepath.Join(dir, entry.Name()))
+	}
+
+	return matches, nil
+}
 
 // Applier manages all the "static" manifests and applies them on the k8s API
 type Applier struct {
 	Name string
 	Dir  string
 
-	log             *logrus.Entry
-	clientFactory   kubernetes.ClientFactory
-	client          dynamic.Interface
-	discoveryClient discovery.CachedDiscoveryInterface
+	log     *logrus.Entry
+	clients Clients
 }
 
-// NewApplier creates new Applier
-func NewApplier(dir string, kubeClientFactory kubernetes.ClientFactory) Applier {
+func NewApplier(dir string, clients Clients) Applier {
 	name := filepath.Base(dir)
 	log := logrus.WithFields(logrus.Fields{
 		"component": "applier",
@@ -52,54 +57,20 @@ func NewApplier(dir string, kubeClientFactory kubernetes.ClientFactory) Applier 
 	})
 
 	return Applier{
-		log:           log,
-		Dir:           dir,
-		Name:          name,
-		clientFactory: kubeClientFactory,
+		log:     log,
+		Dir:     dir,
+		Name:    name,
+		clients: clients,
 	}
-}
-
-func (a *Applier) init() error {
-	c, err := a.clientFactory.GetDynamicClient()
-	if err != nil {
-		return err
-	}
-	discoveryClient, err := a.clientFactory.GetDiscoveryClient()
-	if err != nil {
-		return err
-	}
-
-	a.client = c
-	a.discoveryClient = discoveryClient
-
-	return nil
-}
-
-// just a wrapper for the retry as we need to init "lazily" from both apply and delete directions
-func (a *Applier) lazyInit() error {
-	if a.client == nil || a.discoveryClient == nil {
-		err := retry.OnError(retry.DefaultBackoff, func(err error) bool {
-			return true
-		}, a.init)
-
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
 }
 
 // Apply resources
-func (a *Applier) Apply() error {
-	err := a.lazyInit()
+func (a *Applier) Apply(ctx context.Context) error {
+	files, err := FindManifestFilesInDir(a.Dir)
 	if err != nil {
 		return err
 	}
-	files, err := filepath.Glob(path.Join(a.Dir, "*.yaml"))
-	if err != nil {
-		return err
-	}
+
 	resources, err := a.parseFiles(files)
 	if err != nil {
 		return err
@@ -107,14 +78,12 @@ func (a *Applier) Apply() error {
 	stack := Stack{
 		Name:      a.Name,
 		Resources: resources,
-		Client:    a.client,
-		Discovery: a.discoveryClient,
+		Clients:   a.clients,
 	}
 	a.log.Debug("applying stack")
-	err = stack.Apply(context.Background(), true)
+	err = stack.Apply(ctx, true)
 	if err != nil {
 		a.log.WithError(err).Warn("stack apply failed")
-		a.discoveryClient.Invalidate()
 	} else {
 		a.log.Debug("successfully applied stack")
 	}
@@ -123,41 +92,31 @@ func (a *Applier) Apply() error {
 }
 
 // Delete deletes the entire stack by applying it with empty set of resources
-func (a *Applier) Delete() error {
-	err := a.lazyInit()
-	if err != nil {
-		return err
-	}
-	stack := Stack{
-		Name:      a.Name,
-		Resources: []*unstructured.Unstructured{},
-		Client:    a.client,
-		Discovery: a.discoveryClient,
-	}
+func (a *Applier) Delete(ctx context.Context) error {
+	stack := Stack{Name: a.Name, Clients: a.clients}
 	logrus.Debugf("about to delete a stack %s with empty apply", a.Name)
-	err = stack.Apply(context.Background(), true)
-	return err
+	return stack.Apply(ctx, true)
 }
 
 func (a *Applier) parseFiles(files []string) ([]*unstructured.Unstructured, error) {
 	var resources []*unstructured.Unstructured
-	for _, file := range files {
-		// TODO Probably better to pass in the file stream into decoder and not to read it fully to mem first
-		source, err := ioutil.ReadFile(file)
-		if err != nil {
-			return nil, err
-		}
+	if len(files) == 0 {
+		return resources, nil
+	}
 
-		decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(source), 4096)
-		var resource map[string]interface{}
-		for decoder.Decode(&resource) == nil {
-			item := &unstructured.Unstructured{
-				Object: resource,
-			}
-			if item.GetAPIVersion() != "" && item.GetKind() != "" {
-				resources = append(resources, item)
-				resource = nil
-			}
+	objects, err := resource.NewLocalBuilder().
+		Unstructured().
+		Path(false, files...).
+		Flatten().
+		Do().
+		Infos()
+	if err != nil {
+		return nil, fmt.Errorf("unable to build resources: %w", err)
+	}
+	for _, o := range objects {
+		item := o.Object.(*unstructured.Unstructured)
+		if item.GetAPIVersion() != "" && item.GetKind() != "" {
+			resources = append(resources, item)
 		}
 	}
 

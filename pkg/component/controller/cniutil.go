@@ -1,0 +1,24 @@
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
+
+package controller
+
+import (
+	"path/filepath"
+
+	"github.com/k0sproject/k0s/internal/pkg/file"
+)
+
+func existingCNIProvider(manifestDir string) string {
+	calicoManifestPath := filepath.Join(manifestDir, "calico", "calico-DaemonSet-calico-node.yaml")
+	if file.Exists(calicoManifestPath) {
+		return "calico"
+	}
+
+	kubeRouterManifestPath := filepath.Join(manifestDir, "kuberouter", "kube-router.yaml")
+	if file.Exists(kubeRouterManifestPath) {
+		return "kuberouter"
+	}
+
+	return ""
+}

@@ -1,43 +1,24 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2020 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package cmd
 
 import (
 	"fmt"
-	"log"
-	"net/http"
 	"os"
-
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/cobra"
-	"github.com/spf13/cobra/doc"
-	"github.com/spf13/viper"
-	"gopkg.in/yaml.v2"
+	"path/filepath"
+	"strings"
 
 	"github.com/k0sproject/k0s/cmd/airgap"
 	"github.com/k0sproject/k0s/cmd/api"
-	"github.com/k0sproject/k0s/cmd/backup"
-	"github.com/k0sproject/k0s/cmd/controller"
+	"github.com/k0sproject/k0s/cmd/config"
 	"github.com/k0sproject/k0s/cmd/ctr"
 	"github.com/k0sproject/k0s/cmd/etcd"
 	"github.com/k0sproject/k0s/cmd/install"
+	"github.com/k0sproject/k0s/cmd/keepalived"
 	"github.com/k0sproject/k0s/cmd/kubeconfig"
 	"github.com/k0sproject/k0s/cmd/kubectl"
 	"github.com/k0sproject/k0s/cmd/reset"
-	"github.com/k0sproject/k0s/cmd/restore"
 	"github.com/k0sproject/k0s/cmd/start"
 	"github.com/k0sproject/k0s/cmd/status"
 	"github.com/k0sproject/k0s/cmd/stop"
@@ -46,57 +27,47 @@ import (
 	"github.com/k0sproject/k0s/cmd/validate"
 	"github.com/k0sproject/k0s/cmd/version"
 	"github.com/k0sproject/k0s/cmd/worker"
-	"github.com/k0sproject/k0s/pkg/apis/v1beta1"
+	"github.com/k0sproject/k0s/internal/schemagen"
 	"github.com/k0sproject/k0s/pkg/build"
-	"github.com/k0sproject/k0s/pkg/config"
-)
 
-var (
-	longDesc string
+	"github.com/spf13/cobra"
+	"github.com/spf13/cobra/doc"
+	"github.com/spf13/pflag"
 )
-
-type cliOpts config.CLIOptions
 
 func NewRootCmd() *cobra.Command {
+	var longDesc string
+
 	cmd := &cobra.Command{
-		Use:   "k0s",
-		Short: "k0s - Zero Friction Kubernetes",
-		PersistentPreRun: func(cmd *cobra.Command, args []string) {
-			c := cliOpts(config.GetCmdOpts())
-			// set DEBUG from env, or from command flag
-			if viper.GetString("debug") != "" || c.Debug {
-				logrus.SetLevel(logrus.DebugLevel)
-				go func() {
-					log.Println("starting debug server under", c.DebugListenOn)
-					log.Println(http.ListenAndServe(c.DebugListenOn, nil))
-				}()
-			}
-		},
+		Use:          "k0s",
+		Short:        "k0s - Zero Friction Kubernetes",
+		SilenceUsage: true,
 	}
 
 	cmd.AddCommand(airgap.NewAirgapCmd())
 	cmd.AddCommand(api.NewAPICmd())
-	cmd.AddCommand(backup.NewBackupCmd())
-	cmd.AddCommand(controller.NewControllerCmd())
 	cmd.AddCommand(ctr.NewCtrCommand())
+	cmd.AddCommand(config.NewConfigCmd())
 	cmd.AddCommand(etcd.NewEtcdCmd())
 	cmd.AddCommand(install.NewInstallCmd())
+	cmd.AddCommand(keepalived.NewKeepalivedConfigCmd())
 	cmd.AddCommand(kubeconfig.NewKubeConfigCmd())
 	cmd.AddCommand(kubectl.NewK0sKubectlCmd())
 	cmd.AddCommand(reset.NewResetCmd())
-	cmd.AddCommand(restore.NewRestoreCmd())
 	cmd.AddCommand(start.NewStartCmd())
-	cmd.AddCommand(status.NewStatusCmd())
 	cmd.AddCommand(stop.NewStopCmd())
+	cmd.AddCommand(status.NewStatusCmd())
 	cmd.AddCommand(sysinfo.NewSysinfoCmd())
 	cmd.AddCommand(token.NewTokenCmd())
-	cmd.AddCommand(validate.NewValidateCmd())
+	cmd.AddCommand(validate.NewValidateCmd()) // hidden+deprecated
 	cmd.AddCommand(version.NewVersionCmd())
 	cmd.AddCommand(worker.NewWorkerCmd())
 
 	cmd.AddCommand(newCompletionCmd())
-	cmd.AddCommand(newDefaultConfigCmd())
+	cmd.AddCommand(newDefaultConfigCmd()) // hidden+deprecated
 	cmd.AddCommand(newDocsCmd())
+
+	addPlatformSpecificCommands(cmd)
 
 	cmd.DisableAutoGenTag = true
 	longDesc = "k0s - The zero friction Kubernetes - https://k0sproject.io"
@@ -104,50 +75,130 @@ func NewRootCmd() *cobra.Command {
 		longDesc = longDesc + "\n" + build.EulaNotice
 	}
 	cmd.Long = longDesc
-
-	// workaround for the data-dir location input for the kubectl command
-	cmd.PersistentFlags().AddFlagSet(config.GetKubeCtlFlagSet())
-
 	return cmd
 }
 
 func newDocsCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:       "docs <markdown|man>",
-		Short:     "Generate k0s command documentation",
-		ValidArgs: []string{"markdown", "man"},
-		Args:      cobra.ExactValidArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			switch args[0] {
-			case "markdown":
-				return doc.GenMarkdownTree(NewRootCmd(), "./docs/cli")
-			case "man":
-				return doc.GenManTree(NewRootCmd(), &doc.GenManHeader{Title: "k0s", Section: "1"}, "./man")
-			}
-			return fmt.Errorf("invalid format")
-		},
+	cmd := &cobra.Command{
+		Use:   "docs",
+		Short: "Generate k0s command documentation",
+		Args:  cobra.NoArgs,
+		RunE:  func(*cobra.Command, []string) error { return pflag.ErrHelp }, // Enforce arg validation
 	}
+	cmd.AddCommand(
+		&cobra.Command{Use: "markdown", Short: "Generate Markdown documentation", Args: cobra.NoArgs, RunE: func(*cobra.Command, []string) error {
+			return doc.GenMarkdownTree(NewRootCmd(), "./docs/cli")
+		}},
+		&cobra.Command{Use: "man", Short: "Generate man pages", Args: cobra.NoArgs, RunE: func(*cobra.Command, []string) error {
+			return doc.GenManTree(NewRootCmd(), &doc.GenManHeader{Title: "k0s", Section: "1"}, "./man")
+		}},
+		newJSONSchemaDocsCmd(),
+	)
+	return cmd
 }
 
-func newDefaultConfigCmd() *cobra.Command {
+func newJSONSchemaDocsCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "default-config",
-		Short: "Output the default k0s configuration yaml to stdout",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			c := cliOpts(config.GetCmdOpts())
-			if err := c.buildConfig(); err != nil {
-				return err
+		Use:   "json-schema",
+		Short: "Generate JSON Schemas for k0s APIs",
+		Args:  cobra.NoArgs,
+		RunE:  func(*cobra.Command, []string) error { return pflag.ErrHelp }, // Enforce arg validation
+	}
+	cmd.AddCommand(
+		&cobra.Command{
+			Use:   "list",
+			Short: "List available JSON Schemas",
+			Args:  cobra.NoArgs,
+			RunE: func(cmd *cobra.Command, _ []string) error {
+				identifiers, err := schemagen.List()
+				if err != nil {
+					return err
+				}
+				for _, id := range identifiers {
+					if _, err := fmt.Fprintln(cmd.OutOrStdout(), id); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		},
+		newJSONSchemaGenerateCmd(),
+	)
+	return cmd
+}
+
+func newJSONSchemaGenerateCmd() *cobra.Command {
+	var all bool
+	var outputDir string
+	cmd := &cobra.Command{
+		Use:     "generate {apiVersion kind | --all --output-dir dir}",
+		Aliases: []string{"gen"},
+		Short:   "Generate one or all JSON Schemas",
+		Example: `  k0s docs json-schema gen k0s.k0sproject.io/v1beta1 ClusterConfig > k0s.json
+  k0s docs json-schema gen --all --output-dir schemas`,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if all {
+				return cobra.ExactArgs(0)(cmd, args)
+			}
+			if len(args) > 0 {
+				return cobra.ExactArgs(2)(cmd, args)
 			}
 			return nil
 		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if all {
+				return generateAllSchemas(outputDir)
+			}
+			if len(args) < 1 {
+				return pflag.ErrHelp // Show the help on blank invocations.
+			}
+			data, err := schemagen.Generate(args[0], args[1])
+			if err != nil {
+				return err
+			}
+			_, err = cmd.OutOrStdout().Write(data)
+			return err
+		},
 	}
-	cmd.PersistentFlags().AddFlagSet(config.GetPersistentFlagSet())
+	cmd.Flags().BoolVar(&all, "all", false, "generate all schemas")
+	cmd.Flags().StringVar(&outputDir, "output-dir", "", "output directory for --all")
+	cmd.MarkFlagsRequiredTogether("all", "output-dir")
+	return cmd
+}
+
+func generateAllSchemas(output string) error {
+	identifiers, err := schemagen.List()
+	if err != nil {
+		return err
+	}
+	for _, id := range identifiers {
+		data, err := schemagen.Generate(id.APIVersion, id.Kind)
+		if err != nil {
+			return err
+		}
+		group, version, _ := strings.Cut(id.APIVersion, "/")
+		file := filepath.Join(output, group, strings.ToLower(id.Kind)+"_"+version+".json")
+		if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(file, data, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func newDefaultConfigCmd() *cobra.Command {
+	cmd := config.NewCreateCmd()
+	cmd.Hidden = true
+	cmd.Deprecated = "use 'k0s config create' instead"
+	cmd.Use = "default-config"
 	return cmd
 }
 
 func newCompletionCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "completion <bash|zsh|fish|powershell>",
+		Use:   "completion {bash|zsh|fish|powershell}",
 		Short: "Generate completion script",
 		Long: `To load completions:
 
@@ -179,34 +230,20 @@ $ k0s completion fish > ~/.config/fish/completions/k0s.fish
 `,
 		DisableFlagsInUseLine: true,
 		ValidArgs:             []string{"bash", "zsh", "fish", "powershell"},
-		Args:                  cobra.ExactValidArgs(1),
+		Args:                  cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			out := cmd.OutOrStdout()
 			switch args[0] {
 			case "bash":
-				return cmd.Root().GenBashCompletion(os.Stdout)
+				return cmd.Root().GenBashCompletion(out)
 			case "zsh":
-				return cmd.Root().GenZshCompletion(os.Stdout)
+				return cmd.Root().GenZshCompletion(out)
 			case "fish":
-				return cmd.Root().GenFishCompletion(os.Stdout, true)
+				return cmd.Root().GenFishCompletion(out, true)
 			case "powershell":
-				return cmd.Root().GenPowerShellCompletion(os.Stdout)
+				return cmd.Root().GenPowerShellCompletion(out)
 			}
 			return nil
 		},
-	}
-}
-
-func (c *cliOpts) buildConfig() error {
-	conf, _ := yaml.Marshal(v1beta1.DefaultClusterConfig(c.K0sVars))
-	fmt.Print(string(conf))
-	return nil
-}
-
-func Execute() {
-	// just a hack to trick linter which requires to check for errors
-	// cobra itself already prints out all errors that happen in subcommands
-	err := NewRootCmd().Execute()
-	if err != nil {
-		log.Fatal(err)
 	}
 }

@@ -1,42 +1,34 @@
-/*
-Copyright 2021 k0s authors
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
 package customports
 
 import (
 	"bytes"
-	"context"
 	"html/template"
+	"net"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/k0sproject/k0s/inttest/common"
 	"github.com/stretchr/testify/suite"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8s "k8s.io/client-go/kubernetes"
 )
 
-type Suite struct {
-	common.FootlooseSuite
+type customPortsSuite struct {
+	common.BootlooseSuite
 
-	client *k8s.Clientset
+	client *kubernetes.Clientset
 }
 
 const configWithExternaladdress = `
 apiVersion: k0s.k0sproject.io/v1beta1
-kind: Cluster
+kind: ClusterConfig
 metadata:
   name: k0s
 spec:
@@ -54,10 +46,10 @@ const k0sAPIPort = 9743
 const agentPort = 9132
 const adminPort = 9133
 
-func TestSuite(t *testing.T) {
+func TestCustomPorts(t *testing.T) {
 
-	s := Suite{
-		common.FootlooseSuite{
+	s := customPortsSuite{
+		common.BootlooseSuite{
 			ControllerCount:       3,
 			WorkerCount:           1,
 			KubeAPIExternalPort:   kubeAPIPort,
@@ -71,7 +63,7 @@ func TestSuite(t *testing.T) {
 	suite.Run(t, &s)
 }
 
-func (ds *Suite) getControllerConfig(ipAddress string) string {
+func (s *customPortsSuite) getControllerConfig(ipAddress string) string {
 	data := struct {
 		Address               string
 		KubePort              int
@@ -86,52 +78,67 @@ func (ds *Suite) getControllerConfig(ipAddress string) string {
 		KonnectivityAdminPort: adminPort,
 	}
 	content := bytes.NewBuffer([]byte{})
-	ds.Require().NoError(template.Must(template.New("k0s.yaml").Parse(configWithExternaladdress)).Execute(content, data), "can't execute k0s.yaml template")
+	s.Require().NoError(template.Must(template.New("k0s.yaml").Parse(configWithExternaladdress)).Execute(content, data), "can't execute k0s.yaml template")
 	return content.String()
 }
 
-func (ds *Suite) TestControllerJoinsWithCustomPort() {
+func (s *customPortsSuite) TestControllerJoinsWithCustomPort() {
+	ctx := s.Context()
 
-	ipAddress := ds.GetControllerIPAddress(0)
-	ds.T().Logf("ip address: %s", ipAddress)
-	config := ds.getControllerConfig(ipAddress)
-	ds.PutFile("controller0", "/tmp/k0s.yaml", config)
-	ds.PutFile("controller1", "/tmp/k0s.yaml", config)
-	ds.PutFile("controller2", "/tmp/k0s.yaml", config)
+	ipAddress := s.GetLBAddress()
+	s.T().Logf("ip address: %s", ipAddress)
+	config := s.getControllerConfig(ipAddress)
+	s.PutFile("controller0", "/tmp/k0s.yaml", config)
+	s.PutFile("controller1", "/tmp/k0s.yaml", config)
+	s.PutFile("controller2", "/tmp/k0s.yaml", config)
 
-	ds.Require().NoError(ds.InitController(0, "--config=/tmp/k0s.yaml"))
+	controllerArgs := []string{"--config=/tmp/k0s.yaml"}
+	if strings.Contains(os.Getenv("K0S_INTTEST_TARGET"), "dynamicconfig") {
+		s.T().Log("Enabling dynamic config for controllers")
+		controllerArgs = append(controllerArgs, "--enable-dynamic-config")
+	}
 
-	token, err := ds.GetJoinToken("controller", "", "--config=/tmp/k0s.yaml")
-	ds.Require().NoError(err)
-	ds.Require().NoError(ds.InitController(1, token, "", "--config=/tmp/k0s.yaml"))
+	s.Require().NoError(s.InitController(0, controllerArgs...))
 
-	ds.Require().NoError(ds.InitController(2, token, "", "--config=/tmp/k0s.yaml"))
+	workerToken, err := s.GetJoinToken("worker")
+	s.Require().NoError(err)
+	s.Require().NoError(s.RunWorkersWithToken(workerToken))
 
-	token, err = ds.GetJoinToken("worker", "", "--config=/tmp/k0s.yaml")
-	ds.Require().NoError(err)
-	ds.Require().NoError(ds.RunWorkersWithToken("/var/lib/k0s", token, `--config="/tmp/k0s.yaml"`))
+	restConfig, err := s.GetKubeConfig(s.ControllerNode(0))
+	s.Require().NoError(err)
+	kc, err := kubernetes.NewForConfig(restConfig)
+	s.Require().NoError(err)
 
-	kc, err := ds.KubeClient("controller0", "")
-	ds.Require().NoError(err)
+	err = s.WaitForNodeReady("worker0", kc)
+	s.Require().NoError(err)
 
-	err = ds.WaitForNodeReady("worker0", kc)
+	controllerToken, err := s.GetJoinToken("controller")
+	s.Require().NoError(err)
+	controllerArgs = append([]string{controllerToken, ""}, controllerArgs...)
+	s.Require().NoError(s.InitController(1, controllerArgs...))
+	s.Require().NoError(s.InitController(2, controllerArgs...))
 
-	ds.Require().NoError(err)
+	s.Require().NoError(err)
 
-	pods, err := kc.CoreV1().Pods("kube-system").List(context.TODO(), v1.ListOptions{
-		Limit: 100,
+	s.AssertSomeKubeSystemPods(kc)
+
+	s.T().Log("waiting to see CNI pods ready")
+	s.Require().NoError(common.WaitForKubeRouterReady(ctx, kc), "kube-router did not start")
+	s.T().Log("waiting to see konnectivity-agent pods ready")
+	s.Require().NoError(common.WaitForDaemonSet(ctx, kc, "konnectivity-agent", metav1.NamespaceSystem), "konnectivity-agent did not start")
+
+	s.T().Log("waiting for konnectivity")
+	s.Require().NoError(common.VerifyKonnectivityMesh(ctx, restConfig, kc, s.T(), uint(s.ControllerCount), uint(s.WorkerCount)), "While verifying konnectivity mesh")
+
+	// https://github.com/k0sproject/k0s/issues/1202
+	s.Run("kubeconfigIncludesExternalAddress", func() {
+		expectedURL := url.URL{Scheme: "https", Host: net.JoinHostPort(ipAddress, strconv.Itoa(kubeAPIPort))}
+		ssh, err := s.SSH(ctx, s.ControllerNode(0))
+		s.Require().NoError(err)
+		defer ssh.Disconnect()
+
+		out, err := ssh.ExecWithOutput(ctx, "/usr/local/bin/k0s kubeconfig create user | awk '$1 == \"server:\" {print $2}'")
+		s.Require().NoError(err)
+		s.Require().Equal(expectedURL.String(), out)
 	})
-	ds.Require().NoError(err)
-
-	podCount := len(pods.Items)
-	ds.T().Logf("found %d pods in kube-system", podCount)
-	ds.Greater(podCount, 0, "expecting to see few pods in kube-system namespace")
-
-	ds.T().Log("waiting to see calico pods ready")
-	ds.Require().NoError(common.WaitForKubeRouterReady(kc), "calico did not start")
-	ds.T().Log("waiting to see konnectivity-agent pods ready")
-	ds.Require().NoError(common.WaitForDaemonSet(kc, "konnectivity-agent"), "konnectivity-agent did not start")
-
-	ds.T().Log("waiting to get logs from pods")
-	ds.Require().NoError(common.WaitForPodLogs(kc, "kube-system"))
 }

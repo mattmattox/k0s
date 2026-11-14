@@ -1,8 +1,7 @@
 ---
-
+# Source: https://github.com/projectcalico/calico/blob/v3.32.2/charts/calico/templates/calico-kube-controllers.yaml
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: calico-kube-controllers
   namespace: kube-system
-

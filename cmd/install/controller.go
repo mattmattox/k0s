@@ -1,56 +1,90 @@
-/*
-Copyright 2021 k0s authors
+//go:build linux
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package install
 
 import (
-	"github.com/spf13/cobra"
+	"errors"
+	"fmt"
+	"os"
+	"testing/iotest"
 
+	"github.com/k0sproject/k0s/internal/install"
 	"github.com/k0sproject/k0s/pkg/config"
+
+	"github.com/spf13/cobra"
 )
 
-func installControllerCmd() *cobra.Command {
+func installControllerCmd(installFlags *installFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "controller",
-		Short:   "Helper command for setting up k0s as controller node on a brand-new system. Must be run as root (or with sudo)",
+		Short:   "Install k0s controller on a brand-new system. Must be run as root (or with sudo)",
 		Aliases: []string{"server"},
-		Example: `All default values of controller command will be passed to the service stub unless overriden. 
+		Example: `All default values of controller command will be passed to the service stub unless overridden.
 
-With controller subcommand you can setup a single node cluster by running:
+With the controller subcommand you can setup a single node cluster by running:
 
-	k0s install controller --enable-worker
+	k0s install controller --single
 	`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			c := CmdOpts(config.GetCmdOpts())
-			if err := c.convertFileParamsToAbsolute(); err != nil {
-				cmd.SilenceUsage = true
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if os.Geteuid() != 0 {
+				return errors.New("this command must be run as root")
+			}
+
+			envVars, err := resolveEnvVars(installFlags.envVars)
+			if err != nil {
 				return err
 			}
-			flagsAndVals := []string{"controller"}
-			flagsAndVals = append(flagsAndVals, cmdFlagsToArgs(cmd)...)
-			if err := c.setup("controller", flagsAndVals); err != nil {
-				cmd.SilenceUsage = true
+
+			cmd.SetIn(iotest.ErrReader(errors.New("cannot read configuration from standard input when installing k0s")))
+			k0sVars, err := config.NewCfgVars(cmd)
+			if err != nil {
+				return fmt.Errorf("failed to initialize configuration variables: %w", err)
+			}
+
+			nodeConfig, err := k0sVars.NodeConfig()
+			if err != nil {
+				return fmt.Errorf("failed to load node config: %w", err)
+			}
+
+			if errs := nodeConfig.Validate(); len(errs) > 0 {
+				return fmt.Errorf("invalid node config: %w", errors.Join(errs...))
+			}
+
+			flagsAndVals, err := cmdFlagsToArgs(cmd)
+			if err != nil {
 				return err
 			}
+
+			systemUsers := nodeConfig.Spec.Install.SystemUsers
+			homeDir := k0sVars.DataDir
+			if err := install.EnsureControllerUsers(systemUsers, homeDir); err != nil {
+				return fmt.Errorf("failed to create controller users: %w", err)
+			}
+
+			args := append([]string{"controller"}, flagsAndVals...)
+			if err := install.InstallService(cmd.Context(), args, envVars, installFlags.force); err != nil {
+				return fmt.Errorf("failed to install controller service: %w", err)
+			}
+
+			if installFlags.start {
+				if err := install.StartInstalledService(installFlags.force); err != nil {
+					return fmt.Errorf("failed to start controller service: %w", err)
+				}
+			}
+
 			return nil
 		},
-		PreRunE: preRunValidateConfig,
 	}
-	// append flags
-	cmd.PersistentFlags().AddFlagSet(config.GetPersistentFlagSet())
-	cmd.Flags().AddFlagSet(config.GetControllerFlags())
-	cmd.Flags().AddFlagSet(config.GetWorkerFlags())
+
+	flags := cmd.Flags()
+	flags.AddFlagSet(config.GetPersistentFlagSet())
+	flags.AddFlagSet(config.GetControllerFlags(&config.ControllerOptions{}))
+	flags.AddFlagSet(config.GetWorkerFlags())
+	flags.AddFlagSet(config.FileInputFlag())
+
 	return cmd
 }

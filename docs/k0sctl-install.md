@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2021 k0s authors
+SPDX-License-Identifier: CC-BY-SA-4.0
+-->
+
 # Install using k0sctl
 
 k0sctl is a command-line tool for bootstrapping and managing k0s clusters. k0sctl connects to the provided hosts using SSH and gathers information on the hosts, with which it forms a cluster by configuring the hosts, deploying k0s, and then connecting the k0s nodes together.
@@ -10,7 +15,7 @@ With k0sctl, you can create multi-node clusters in a manner that is automatic an
 
 ## Prerequisites
 
-You can execute k0sctl on any system that supports the Go language. Pre-compiled k0sctl binaries are availble on the [k0sctl releases page](https://github.com/k0sproject/k0sctl)).
+You can execute k0sctl on any system that supports the Go language. Pre-compiled k0sctl binaries are available on the [k0sctl releases page](https://github.com/k0sproject/k0sctl)).
 
 **Note**: For target host prerequisites information, refer to the [k0s System Requirements](system-requirements.md).
 
@@ -49,7 +54,7 @@ k0sctl is a single binary, the instructions for downloading and installing of wh
           keyPath: ~/.ssh/id_rsa
     ```
 
-2. Provide each host with a valid IP address that is reachable by k0ctl, and the connection details for an SSH connection.
+2. Provide each host with a valid IP address that is reachable by k0sctl, and the connection details for an SSH connection.
 
  **Note**: Refer to the [k0sctl documentation](https://github.com/k0sproject/k0sctl#configuration-file-spec-fields) for k0sctl configuration specifications.
 
@@ -57,7 +62,9 @@ k0sctl is a single binary, the instructions for downloading and installing of wh
 
 Run `k0sctl apply` to perform the cluster deployment:
 
-```shell
+**Note** k0sctl uses `k0sctl.yaml` by default. You can specify a different file with `--config <path>`
+
+```console
 $ k0sctl apply --config k0sctl.yaml
 
 ⠀⣿⣿⡇⠀⠀⢀⣴⣾⣿⠟⠁⢸⣿⣿⣿⣿⣿⣿⣿⡿⠛⠁⠀⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀█████████ █████████ ███
@@ -66,10 +73,7 @@ $ k0sctl apply --config k0sctl.yaml
 ⠀⣿⣿⡏⠻⣿⣷⣤⡀⠀⠀⠀⠸⠛⠁⠀⠸⠋⠁⠀⠀⣿⣿⡇⠈⠉⠉⠉⠉⠉⠉⠉⠉⢹⣿⣿⠀███          ███    ███
 ⠀⣿⣿⡇⠀⠀⠙⢿⣿⣦⣀⠀⠀⠀⣠⣶⣶⣶⣶⣶⣶⣿⣿⡇⢰⣶⣶⣶⣶⣶⣶⣶⣶⣾⣿⣿⠀█████████    ███    ██████████
 
-INFO k0sctl 0.0.0 Copyright 2021, Mirantis Inc.
-INFO Anonymized telemetry will be sent to Mirantis.
-INFO By continuing to use k0sctl you agree to these terms:
-INFO https://k0sproject.io/licenses/eula
+k0sctl v0.21.0 Copyright 2023, k0sctl authors.
 INFO ==> Running phase: Connect to hosts
 INFO [ssh] 10.0.0.1:22: connected
 INFO [ssh] 10.0.0.2:22: connected
@@ -83,8 +87,8 @@ INFO [ssh] 10.0.0.1:22: discovered 10.12.18.133 as private address
 INFO ==> Running phase: Validate hosts
 INFO ==> Running phase: Gather k0s facts
 INFO ==> Running phase: Download K0s on the hosts
-INFO [ssh] 10.0.0.2:22: downloading k0s 0.11.0
-INFO [ssh] 10.0.0.1:22: downloading k0s 0.11.0
+INFO [ssh] 10.0.0.2:22: downloading k0s {{{ k0s_version }}}
+INFO [ssh] 10.0.0.1:22: downloading k0s {{{ k0s_version }}}
 INFO ==> Running phase: Configure K0s
 WARN [ssh] 10.0.0.1:22: generating default configuration
 INFO [ssh] 10.0.0.1:22: validating configuration
@@ -101,7 +105,7 @@ INFO [ssh] 10.0.0.2:22: starting service
 INFO [ssh] 10.0.0.2:22: waiting for node to become ready
 INFO ==> Running phase: Disconnect from hosts
 INFO ==> Finished in 2m2s
-INFO k0s cluster version 0.11.0 is now installed
+INFO k0s cluster version {{{ k0s_version }}} is now installed
 INFO Tip: To access the cluster you can now fetch the admin kubeconfig using:
 INFO      k0sctl kubeconfig
 ```
@@ -111,13 +115,16 @@ INFO      k0sctl kubeconfig
 To access your k0s cluster, use k0sctl to generate a `kubeconfig` for the purpose.
 
 ```shell
-k0sctl kubeconfig > kubeconfig
+k0sctl kubeconfig --config k0sctl.yaml > kubeconfig
 ```
 
 With the `kubeconfig`, you can access your cluster using either kubectl or [Lens](https://k8slens.dev/).
 
 ```shell
-$ kubectl get pods --kubeconfig kubeconfig -A
+kubectl get pods --kubeconfig kubeconfig -A
+```
+
+```shell
 NAMESPACE     NAME                                       READY   STATUS    RESTARTS   AGE
 kube-system   calico-kube-controllers-5f6546844f-w8x27   1/1     Running   0          3m50s
 kube-system   calico-node-vd7lx                          1/1     Running   0          3m44s

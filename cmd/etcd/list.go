@@ -1,54 +1,68 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package etcd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/cobra"
-
+	"github.com/k0sproject/k0s/internal/k0scontext"
 	"github.com/k0sproject/k0s/pkg/config"
 	"github.com/k0sproject/k0s/pkg/etcd"
+
+	"github.com/spf13/cobra"
 )
+
+type etcdMemberListClient interface {
+	ListMembers(context.Context) ([]etcd.Member, error)
+	Close() error
+}
 
 func etcdListCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "member-list",
-		Short: "Returns etcd cluster members list",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			c := CmdOpts(config.GetCmdOpts())
-			ctx := context.Background()
-			etcdClient, err := etcd.NewClient(c.K0sVars.CertRootDir, c.K0sVars.EtcdCertDir)
+		Short: "List etcd cluster members (JSON encoded)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cmd.SilenceUsage = true
+
+			opts, err := config.GetCmdOpts(cmd)
 			if err != nil {
-				return fmt.Errorf("can't list etcd cluster members: %v", err)
+				return err
 			}
+			nodeConfig, err := opts.K0sVars.NodeConfig()
+			if err != nil {
+				return err
+			}
+			ctx := cmd.Context()
+			etcdClient := k0scontext.Value[etcdMemberListClient](ctx)
+			if etcdClient == nil {
+				etcdClient, err = etcd.NewClient(opts.K0sVars.CertRootDir, opts.K0sVars.EtcdCertDir, nodeConfig.Spec.Storage.Etcd)
+				if err != nil {
+					return fmt.Errorf("can't list etcd cluster members: %w", err)
+				}
+			}
+			defer etcdClient.Close()
+
 			members, err := etcdClient.ListMembers(ctx)
 			if err != nil {
-				return fmt.Errorf("can't list etcd cluster members: %v", err)
+				return fmt.Errorf("can't list etcd cluster members: %w", err)
 			}
-			l := logrus.New()
-			l.SetFormatter(&logrus.JSONFormatter{})
-
-			l.WithField("members", members).
-				Info("done")
-			return nil
+			response := struct {
+				Members map[string]string `json:"members"`
+			}{
+				make(map[string]string, len(members)),
+			}
+			for _, member := range members {
+				response.Members[member.Name] = member.PeerURL
+			}
+			return json.NewEncoder(cmd.OutOrStdout()).Encode(response)
 		},
 	}
-	cmd.PersistentFlags().AddFlagSet(config.GetPersistentFlagSet())
+
+	cmd.Flags().AddFlagSet(config.GetPersistentFlagSet())
+
 	return cmd
 }

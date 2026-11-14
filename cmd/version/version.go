@@ -1,10 +1,15 @@
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
+
 package version
 
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 
 	"github.com/k0sproject/k0s/pkg/build"
+
 	"github.com/spf13/cobra"
 )
 
@@ -17,8 +22,8 @@ func NewVersionCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "version",
 		Short: "Print the k0s version",
-
-		Run: func(cmd *cobra.Command, args []string) {
+		Args:  cobra.NoArgs,
+		Run: func(cmd *cobra.Command, _ []string) {
 			info := versionInfo{
 				Version:      build.Version,
 				Runc:         build.RuncVersion,
@@ -29,13 +34,14 @@ func NewVersionCmd() *cobra.Command {
 				Konnectivity: build.KonnectivityVersion,
 			}
 
-			info.String()
+			info.Print(cmd.OutOrStdout())
 		},
 	}
 
-	// append flags
-	cmd.PersistentFlags().BoolVarP(&all, "all", "a", false, "use to print all k0s version info")
-	cmd.PersistentFlags().BoolVarP(&isJsn, "json", "j", false, "use to print all k0s version info in json")
+	flags := cmd.Flags()
+	flags.BoolVarP(&all, "all", "a", false, "use to print all k0s version info")
+	flags.BoolVarP(&isJsn, "json", "j", false, "use to print all k0s version info in json")
+
 	return cmd
 }
 
@@ -49,19 +55,19 @@ type versionInfo struct {
 	Konnectivity string `json:"konnectivity,omitempty"`
 }
 
-func (v versionInfo) String() {
+func (v versionInfo) Print(w io.Writer) {
 	if all {
-		fmt.Println("k0s :", v.Version)
-		fmt.Println("runc :", v.Runc)
-		fmt.Println("containerd :", v.Containerd)
-		fmt.Println("kubernetes :", v.Kubernetes)
-		fmt.Println("kine :", v.Kine)
-		fmt.Println("etcd :", v.Etcd)
-		fmt.Println("konnectivity :", v.Konnectivity)
+		fmt.Fprintln(w, "k0s :", v.Version)
+		fmt.Fprintln(w, "runc :", v.Runc)
+		fmt.Fprintln(w, "containerd :", v.Containerd)
+		fmt.Fprintln(w, "kubernetes :", v.Kubernetes)
+		fmt.Fprintln(w, "kine :", v.Kine)
+		fmt.Fprintln(w, "etcd :", v.Etcd)
+		fmt.Fprintln(w, "konnectivity :", v.Konnectivity)
 	} else if isJsn {
 		jsn, _ := json.MarshalIndent(v, "", "   ")
-		fmt.Println(string(jsn))
+		fmt.Fprintln(w, string(jsn))
 	} else {
-		fmt.Println(v.Version)
+		fmt.Fprintln(w, v.Version)
 	}
 }

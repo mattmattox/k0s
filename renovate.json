@@ -1,0 +1,592 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":configMigration",
+    ":gitSignOff",
+    ":automergeMinor",
+    ":semanticCommitsDisabled"
+  ],
+  "gitAuthor": "k0s-bot <110385897+k0s-bot@users.noreply.github.com>",
+  "labels": [
+    "dependencies"
+  ],
+  "baseBranchPatterns": [
+    "main",
+    "/^release-1\\.3[4-6]$/"
+  ],
+  "prTitleStrict": true,
+  "commitMessageAction": "Bump",
+  "commitMessageTopic": "{{depName}}",
+  "groupSingleUpdates": false,
+  "vulnerabilityAlerts": {
+    "enabled": false
+  },
+  "enabledManagers": [
+    "gomod",
+    "terraform",
+    "custom.regex"
+  ],
+  "postUpdateOptions": [
+    "gomodTidy"
+  ],
+  "packageRules": [
+    {
+      "description": "Use OpenTofu registry for Terraform providers and modules",
+      "matchDatasources": [
+        "terraform-provider",
+        "terraform-module"
+      ],
+      "registryUrls": [
+        "https://registry.opentofu.org"
+      ]
+    },
+    {
+      "description": "Include patch version in minor Go bumps",
+      "matchDepNames": [
+        "go"
+      ],
+      "commitMessageExtra": "{{~#if (containsString (replace '\\d+\\.\\d+\\.\\d+' 'x.y.z' (toJSON (distinct (lookupArray upgrades 'prettyNewVersion')))) 'x.y.z')}}{{~#each (distinct (lookupArray upgrades 'prettyNewVersion'))}}{{~#if (containsString (replace '\\d+\\.\\d+\\.\\d+' 'x.y.z' .) 'x.y.z')}} to {{{.}}}{{/if}}{{/each~}}{{~else}}{{~#each (distinct (lookupArray upgrades 'prettyNewVersion'))}} to {{{.}}}{{/each~}}{{/if~}}"
+    },
+    {
+      "description": "Special version scheme for k0sproject OCI images",
+      "matchPackageNames": [
+        "quay.io/k0sproject/*",
+        "docker.io/sigwindowstools/kube-proxy"
+      ],
+      "versioning": "regex:^v?(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(?:-(?<prerelease>(?:alpha|beta|rc)\\.\\d+))?(?:-(?<compatibility>.+?))??(?:-(?:iptables\\d+\\.\\d+\\.\\d+))?(?:-(?:k0s\\.)?(?<build>\\d+))?$"
+    },
+    {
+      "description": "Ignore all Go dependencies by default",
+      "enabled": false,
+      "matchManagers": [
+        "gomod"
+      ]
+    },
+    {
+      "description": "Kubernetes",
+      "enabled": true,
+      "matchPackageNames": [
+        "k8s.io/kubernetes"
+      ]
+    },
+    {
+      "description": "Kubernetes Go libraries",
+      "enabled": true,
+      "matchPackageNames": [
+        "k8s.io/api",
+        "k8s.io/apiextensions-apiserver",
+        "k8s.io/apimachinery",
+        "k8s.io/apiserver",
+        "k8s.io/cli-runtime",
+        "k8s.io/client-go",
+        "k8s.io/cloud-provider",
+        "k8s.io/cluster-bootstrap",
+        "k8s.io/code-generator",
+        "k8s.io/component-base",
+        "k8s.io/component-helpers",
+        "k8s.io/controller-manager",
+        "k8s.io/cri-api",
+        "k8s.io/cri-client",
+        "k8s.io/cri-streaming",
+        "k8s.io/csi-translation-lib",
+        "k8s.io/dynamic-resource-allocation",
+        "k8s.io/endpointslice",
+        "k8s.io/externaljwt",
+        "k8s.io/kms",
+        "k8s.io/kube-aggregator",
+        "k8s.io/kube-controller-manager",
+        "k8s.io/kube-proxy",
+        "k8s.io/kube-scheduler",
+        "k8s.io/kubectl",
+        "k8s.io/kubelet",
+        "k8s.io/metrics",
+        "k8s.io/mount-utils",
+        "k8s.io/pod-security-admission",
+        "k8s.io/sample-apiserver",
+        "k8s.io/sample-cli-plugin",
+        "k8s.io/sample-controller",
+        "k8s.io/streaming"
+      ],
+      "allowedVersions": "/^v0\\./"
+    },
+    {
+      "description": "Group Kubernetes dependencies",
+      "matchPackageNames": [
+        "k8s.io/**",
+        "**/kubernetes",
+        "**/kube-proxy"
+      ],
+      "groupName": "Kubernetes",
+      "groupSlug": "kubernetes",
+      "commitMessageExtra": "{{~#if (includes (lookupArray upgrades \"depName\") \"k8s.io/kubernetes\")}}{{~#each upgrades}}{{~#if (equals depName \"k8s.io/kubernetes\")}} to {{{newVersion}}}{{/if}}{{/each~}}{{~else}}{{~#each (distinct (lookupArray upgrades \"prettyNewVersion\"))}} to {{{.}}}{{/each~}}{{/if~}}",
+      "ignoreUnstable": false,
+      "respectLatest": false
+    },
+    {
+      "description": "Separate Kubernetes patch and minor bumps for the main branch",
+      "matchBaseBranches": [
+        "main"
+      ],
+      "matchPackageNames": [
+        "k8s.io/**",
+        "**/kubernetes",
+        "**/kube-proxy"
+      ],
+      "separateMinorPatch": true
+    },
+    {
+      "description": "Ignore some pinned dependencies",
+      "enabled": false,
+      "matchDatasources": [
+        "github-tags"
+      ],
+      "matchDepNames": [
+        "actions/cache",
+        "cilium/ebpf",
+        "euank/go-kmsg-parser",
+        "kubernetes/system-validators",
+        "torvalds/linux"
+      ]
+    },
+    {
+      "description": "Group all Calico bumps",
+      "enabled": true,
+      "matchPackageNames": [
+        "docker.io/calico/*",
+        "quay.io/k0sproject/calico-*",
+        "projectcalico/calico"
+      ],
+      "groupName": "Calico",
+      "groupSlug": "calico",
+      "commitMessageExtra": "{{~#if (includes (lookupArray upgrades \"depName\") \"quay.io/k0sproject/calico-node\")}}{{~#each (distinct (lookupArray upgrades \"prettyNewVersion\"))}}{{~#if (containsString . \"-\")}} to {{{.}}}{{/if}}{{/each~}}{{~else}}{{~#each (distinct (lookupArray upgrades \"prettyNewVersion\"))}} to {{{.}}}{{/each~}}{{/if~}}"
+    },
+    {
+      "description": "Group all etcd bumps",
+      "enabled": true,
+      "matchPackageNames": [
+        "go.etcd.io/etcd/**/v3",
+        "etcd-io/etcd"
+      ],
+      "groupName": "etcd",
+      "groupSlug": "etcd"
+    },
+    {
+      "description": "Group all containerd bumps",
+      "enabled": true,
+      "matchPackageNames": [
+        "containerd/containerd",
+        "/^github.com\\/containerd\\/containerd(\\/v[0-9]+)?$/"
+      ],
+      "groupName": "containerd",
+      "groupSlug": "containerd"
+    },
+    {
+      "description": "Ignore indirect containerd v1 gomod bumps",
+      "enabled": false,
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchDepTypes": [
+        "indirect"
+      ],
+      "matchPackageNames": [
+        "github.com/containerd/containerd"
+      ]
+    },
+    {
+      "description": "Group all konnectivity bumps",
+      "enabled": true,
+      "matchDepNames": [
+        "**/apiserver-network-proxy*",
+        "sigs.k8s.io/apiserver-network-proxy/*"
+      ],
+      "groupName": "konnectivity",
+      "groupSlug": "konnectivity",
+      "commitMessageExtra": "{{~#if (includes (lookupArray upgrades \"depName\") \"quay.io/k0sproject/apiserver-network-proxy-agent\")}}{{~#each (distinct (lookupArray upgrades \"prettyNewVersion\"))}}{{~#if (containsString . \"-\")}} to {{{.}}}{{/if}}{{/each~}}{{~else}}{{~#each (distinct (lookupArray upgrades \"prettyNewVersion\"))}} to {{{.}}}{{/each~}}{{/if~}}"
+    },
+    {
+      "description": "Group all Helm bumps",
+      "enabled": true,
+      "matchDepNames": [
+        "helm.sh/helm/**",
+        "helm/helm"
+      ],
+      "groupName": "Helm",
+      "groupSlug": "helm"
+    },
+    {
+      "description": "Group all sonobuoy bumps",
+      "enabled": true,
+      "matchDepNames": [
+        "**/sonobuoy"
+      ],
+      "groupName": "sonobuoy",
+      "groupSlug": "sonobuoy"
+    },
+    {
+      "description": "Group all Traefik bumps",
+      "enabled": true,
+      "matchDepNames": [
+        "**/traefik"
+      ],
+      "groupName": "Traefik",
+      "groupSlug": "traefik",
+      "commitMessageExtra": "{{~#if (includes (lookupArray upgrades \"depName\") \"quay.io/k0sproject/traefik\")}}{{~#each (distinct (lookupArray upgrades \"prettyNewVersion\"))}}{{~#if (containsString . \"-\")}} to {{{.}}}{{/if}}{{/each~}}{{~else}}{{~#each (distinct (lookupArray upgrades \"prettyNewVersion\"))}} to {{{.}}}{{/each~}}{{/if~}}"
+    },
+    {
+      "description": "Run codegen if required",
+      "matchDepNames": [
+        "kubernetes-sigs/controller-tools"
+      ],
+      "postUpgradeTasks": {
+        "executionMode": "branch",
+        "commands": [
+          "sh -c 'install-tool golang $(./vars.sh go_version)'",
+          "make DOCKER='' EMBEDDED_BINS_BUILDMODE=none codegen"
+        ]
+      }
+    },
+    {
+      "description": "Only bump the main branch by default",
+      "enabled": false,
+      "prTitleStrict": false,
+      "matchBaseBranches": [
+        "!main"
+      ],
+      "ignoreUnstable": true,
+      "respectLatest": true
+    },
+    {
+      "description": "Bump Go for release-1.36",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.36"
+      ],
+      "matchDepNames": [
+        "go"
+      ],
+      "allowedVersions": "<=1.26"
+    },
+    {
+      "description": "Bump Kubernetes for release-1.36",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.36"
+      ],
+      "matchPackageNames": [
+        "k8s.io/**",
+        "**/kubernetes",
+        "**/kube-proxy"
+      ],
+      "allowedVersions": "/^v?[01]\\.36\\./"
+    },
+    {
+      "description": "Bump Alpine for release-1.36",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.36"
+      ],
+      "matchDepNames": [
+        "docker.io/library/alpine"
+      ],
+      "allowedVersions": "<=3.23"
+    },
+    {
+      "description": "Bump etcd for release-1.36",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.36"
+      ],
+      "matchPackageNames": [
+        "go.etcd.io/etcd/**/v3",
+        "etcd-io/etcd"
+      ],
+      "allowedVersions": "<=3.6"
+    },
+    {
+      "description": "Bump keepalived for release-1.36",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.36"
+      ],
+      "matchDepNames": [
+        "acassen/keepalived"
+      ],
+      "allowedVersions": "<=2.3"
+    },
+    {
+      "description": "Bump kine for release-1.36",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.36"
+      ],
+      "matchDepNames": [
+        "k3s-io/kine"
+      ],
+      "allowedVersions": "<=0.16"
+    },
+    {
+      "description": "Bump konnectivity for release-1.36",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.36"
+      ],
+      "matchDepNames": [
+        "**/apiserver-network-proxy*",
+        "sigs.k8s.io/apiserver-network-proxy/*"
+      ],
+      "allowedVersions": "/^v?0\\.36\\./"
+    },
+    {
+      "description": "Bump runc for release-1.36",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.36"
+      ],
+      "matchDepNames": [
+        "opencontainers/runc"
+      ],
+      "allowedVersions": "<=1.4"
+    },
+    {
+      "description": "Bump Helm for release-1.36",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.36"
+      ],
+      "matchDepNames": [
+        "helm.sh/helm/**",
+        "helm/helm"
+      ],
+      "allowedVersions": "<=3.21"
+    },
+    {
+      "description": "Bump Calico for release-1.35",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.35"
+      ],
+      "matchDepNames": [
+        "docker.io/calico/*",
+        "quay.io/k0sproject/calico-*",
+        "projectcalico/calico"
+      ],
+      "allowedVersions": "/^v?3\\.31\\./"
+    },
+    {
+      "description": "Bump cni-node for release-1.35",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.35"
+      ],
+      "matchDepNames": [
+        "quay.io/k0sproject/cni-node"
+      ],
+      "allowedVersions": "/^v?1\\.8\\./"
+    },
+    {
+      "description": "Bump containerd for release-1.35",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.35"
+      ],
+      "matchPackageNames": [
+        "containerd/containerd",
+        "/^github.com\\/containerd\\/containerd(\\/v[0-9]+)?$/"
+      ],
+      "allowedVersions": "<=1.7"
+    },
+    {
+      "description": "Bump Kubernetes for release-1.35",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.35"
+      ],
+      "matchPackageNames": [
+        "k8s.io/**",
+        "**/kubernetes",
+        "**/kube-proxy"
+      ],
+      "allowedVersions": "/^v?[01]\\.35\\./"
+    },
+    {
+      "description": "Bump konnectivity for release-1.35",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.35"
+      ],
+      "matchDepNames": [
+        "**/apiserver-network-proxy*",
+        "sigs.k8s.io/apiserver-network-proxy/*"
+      ],
+      "allowedVersions": "/^v?0\\.34\\./"
+    },
+    {
+      "description": "Bump Envoy for release-1.35",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.35"
+      ],
+      "matchDepNames": [
+        "quay.io/k0sproject/envoy-distroless"
+      ],
+      "allowedVersions": "<=1.37"
+    },
+    {
+      "description": "Bump Alpine for release-1.34",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.34"
+      ],
+      "matchDepNames": [
+        "docker.io/library/alpine"
+      ],
+      "allowedVersions": "<=3.22"
+    },
+    {
+      "description": "Bump Calico for release-1.34",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.34"
+      ],
+      "matchDepNames": [
+        "docker.io/calico/*",
+        "quay.io/k0sproject/calico-*",
+        "projectcalico/calico"
+      ],
+      "allowedVersions": "/^v?3\\.29\\./"
+    },
+    {
+      "description": "Bump Envoy for release-1.34",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.34"
+      ],
+      "matchDepNames": [
+        "quay.io/k0sproject/envoy-distroless"
+      ],
+      "allowedVersions": "<=1.34"
+    },
+    {
+      "description": "Bump Kubernetes for release-1.34",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.34"
+      ],
+      "matchPackageNames": [
+        "k8s.io/**",
+        "**/kubernetes",
+        "**/kube-proxy"
+      ],
+      "allowedVersions": "/^v?[01]\\.34\\./"
+    },
+    {
+      "description": "Bump konnectivity for release-1.34",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.34"
+      ],
+      "matchDepNames": [
+        "**/apiserver-network-proxy*",
+        "sigs.k8s.io/apiserver-network-proxy/*"
+      ],
+      "allowedVersions": "/^v?0\\.33\\./"
+    },
+    {
+      "description": "Bump runc for release-1.34",
+      "enabled": true,
+      "matchBaseBranches": [
+        "release-1.34"
+      ],
+      "matchDepNames": [
+        "opencontainers/runc"
+      ],
+      "allowedVersions": "<=1.3"
+    },
+    {
+      "description": "Disallow Kubernetes digest bumps for release branches",
+      "enabled": false,
+      "matchBaseBranches": [
+        "/^release-1\\.\\d+$/"
+      ],
+      "matchPackageNames": [
+        "k8s.io/**"
+      ],
+      "matchUpdateTypes": [
+        "digest"
+      ]
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Bump minimum Go version",
+      "managerFilePatterns": [
+        "**/go.mod"
+      ],
+      "matchStrings": [
+        "\\bgo (?<currentValue>\\d+\\.\\d+)\\.\\d+\\b"
+      ],
+      "depNameTemplate": "go",
+      "datasourceTemplate": "golang-version",
+      "extractVersionTemplate": "^(?<version>\\d+\\.\\d+)",
+      "autoReplaceStringTemplate": "go {{{newValue}}}.0",
+      "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "description": "Bump container image references in non-Dockerfiles",
+      "managerFilePatterns": [
+        "**/*.go",
+        "**/*.md",
+        "**/*.mk",
+        "**/*.patch",
+        "**/*.py",
+        "**/*.sh",
+        "**/*.tf",
+        "**/*.tftpl",
+        "**/*.txt",
+        "**/*.yaml",
+        "**/*.yml",
+        "**/Makefile*"
+      ],
+      "matchStrings": [
+        "(?:(?://|#) renovate: versioning=(?<versioning>\\S+)\\n[^\\n]*?)?\\b(?<depName>(docker|k8s\\.gcr|quay|registry\\.k8s)\\.io/(?:[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*)(?::|.*\\n.*= \")(?<currentValue>v?[0-9_][\\w.-]{0,127})(?:@(?<currentDigest>sha256:[a-f0-9]{64}))?"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "{{#if versioning}}{{{versioning}}}{{else}}docker{{/if}}"
+    },
+    {
+      "customType": "regex",
+      "description": "Bump GitHub source code links",
+      "managerFilePatterns": [
+        "**/*"
+      ],
+      "matchStrings": [
+        "\\bgithub.com/(?<depName>[a-z0-9][a-z0-9._-]+/[a-z0-9][a-z0-9._-]+)/blob/v(?<currentValue>[a-z0-9][a-z0-9._-]+)/",
+        "\\bgithub.com/golang/(?<depName>go)/blob/go(?<currentValue>[^/]+)/"
+      ],
+      "datasourceTemplate": "{{#if (equals depName \"go\")}}golang-version{{else}}github-tags{{/if}}",
+      "versioningTemplate": "semver",
+      "extractVersionTemplate": "^v?(?<version>.+)"
+    },
+    {
+      "customType": "regex",
+      "description": "Generic version bumps based on comments",
+      "managerFilePatterns": [
+        "**/Makefile*",
+        "**/Dockerfile*",
+        "**/*.yaml",
+        "**/*.yml"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+)( registryUrl=(?<registryUrl>.+))? depName=(?<depName>\\S+)( versioning=(?<versioning>.+))?\\n[^:=\\n]+[:=][ \\t]*[\"']?(?<currentValue>[^@\\s\"']+)(?:@(?<currentDigest>[0-9a-f]{40}))?[\"']?[ \\t]*(:?#|\\n)",
+        "[=:][ \\t]*[\"']?(?<currentValue>\\S+?)[\"']?[ \\t]*# renovate: datasource=(?<datasource>\\S+)( registryUrl=(?<registryUrl>.+))? depName=(?<depName>\\S+)( versioning=(?<versioning>.+))?\\n"
+      ],
+      "datasourceTemplate": "{{{datasource}}}",
+      "versioningTemplate": "{{#if versioning}}{{{versioning}}}{{else}}semver{{/if}}",
+      "extractVersionTemplate": "^v?(?<version>.+)"
+    }
+  ]
+}

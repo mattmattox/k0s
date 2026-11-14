@@ -1,4 +1,5 @@
 ---
+# Source: https://github.com/projectcalico/calico/blob/v3.32.2/charts/calico/templates/calico-node-rbac.yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -8,7 +9,6 @@ roleRef:
   kind: ClusterRole
   name: calico-node
 subjects:
-- kind: ServiceAccount
-  name: calico-node
-  namespace: kube-system
-
+  - kind: ServiceAccount
+    name: calico-node
+    namespace: kube-system

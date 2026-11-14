@@ -1,0 +1,194 @@
+// SPDX-FileCopyrightText: 2022 k0s authors
+// SPDX-License-Identifier: Apache-2.0
+
+package kuberouter
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/k0sproject/k0s/pkg/apis/k0s/v1beta1"
+	"github.com/k0sproject/k0s/pkg/applier"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes/scheme"
+
+	"sigs.k8s.io/yaml"
+
+	"github.com/k0sproject/k0s/inttest/common"
+	"github.com/k0sproject/k0s/inttest/common/ociimages"
+	"github.com/stretchr/testify/suite"
+)
+
+type KubeRouterHairpinSuite struct {
+	common.BootlooseSuite
+	isIPv6Only bool
+}
+
+func (s *KubeRouterHairpinSuite) TestK0sGetsUp() {
+	{
+		clusterCfg := &v1beta1.ClusterConfig{
+			Spec: &v1beta1.ClusterSpec{
+				Network: func() *v1beta1.Network {
+					network := v1beta1.DefaultNetwork()
+					network.Provider = "kuberouter"
+					network.KubeProxy = &v1beta1.KubeProxy{
+						NodePortAddresses: []string{"127.0.0.0/24", "127.0.1.0/24"},
+					}
+					return network
+				}(),
+			},
+		}
+		if s.isIPv6Only {
+			s.T().Log("Running in IPv6-only mode")
+			clusterCfg.Spec.Network.PodCIDR = "fd00::/108"
+			clusterCfg.Spec.Network.ServiceCIDR = "fd01::/108"
+			clusterCfg.Spec.Network.KubeProxy.NodePortAddresses = []string{"::1/96"}
+		}
+
+		config, err := yaml.Marshal(clusterCfg)
+		s.Require().NoError(err)
+		s.WriteFileContent(s.ControllerNode(0), "/tmp/k0s.yaml", config)
+	}
+
+	s.Require().NoError(s.InitController(0, "--config=/tmp/k0s.yaml", "--disable-components=konnectivity-server,metrics-server", "--feature-gates=IPv6SingleStack=true"))
+
+	if s.isIPv6Only {
+		s.T().Log("Setting up IPv6 DNS for workers")
+		common.ConfigureIPv6ResolvConf(&s.BootlooseSuite)
+	}
+	s.MakeDir(s.ControllerNode(0), "/var/lib/k0s/manifests/test")
+	s.putManifests("/var/lib/k0s/manifests/test/hairpin.yaml", s.hairpinApp()...)
+	s.Require().NoError(s.RunWorkers())
+
+	kc, err := s.KubeClient("controller0", "")
+	s.Require().NoError(err)
+
+	err = s.WaitForNodeReady("worker0", kc)
+	s.NoError(err)
+
+	err = s.WaitForNodeReady("worker1", kc)
+	s.NoError(err)
+
+	s.T().Log("waiting to see kube-router pods ready")
+	s.NoError(common.WaitForKubeRouterReady(s.Context(), kc), "kube-router did not start")
+
+	s.T().Log("waiting to see hairpin pod ready")
+	err = common.WaitForPod(s.Context(), kc, "hairpin-pod", metav1.NamespaceDefault)
+	s.Require().NoError(err)
+
+	s.Run("check hairpin mode", func() {
+		// All done via SSH as it's much simpler :)
+		// e.g. execing via client-go is super complex and would require too much wiring
+		ssh, err := s.SSH(s.Context(), s.ControllerNode(0))
+		s.Require().NoError(err)
+		defer ssh.Disconnect()
+
+		const wget = "k0s kc exec -n default hairpin-pod -c wget -- wget"
+		for _, test := range []struct {
+			dnsName string
+			desc    string
+		}{
+			{
+				"localhost",
+				"pod can reach itself via loopback",
+			},
+			{
+				"hairpin",
+				"pod can reach itself via service name",
+			},
+		} {
+			s.Run(test.desc, func() {
+				err = wait.PollImmediate(5*time.Second, 2*time.Minute, func() (bool, error) {
+					output, err := ssh.ExecWithOutput(s.Context(), fmt.Sprintf("%s -T 5 -qO- http://%s", wget, test.dnsName))
+					if err != nil {
+						s.T().Log(output)
+						return false, nil
+					}
+					return s.Contains(output, "Thank you for using nginx."), nil
+				})
+				s.Require().NoError(err)
+			})
+		}
+	})
+	s.Run("verify there aren't pods restarted once the test finishes", func() {
+		for _, err := range common.VerifyNoRestartedPods(s.Context(), kc) {
+			s.NoError(err)
+		}
+	})
+}
+
+func TestKubeRouterHairpinSuite(t *testing.T) {
+	s := KubeRouterHairpinSuite{
+		BootlooseSuite: common.BootlooseSuite{
+			ControllerCount: 1,
+			WorkerCount:     2,
+		},
+	}
+	if strings.Contains(os.Getenv("K0S_INTTEST_TARGET"), "ipv6") {
+		t.Log("Configuring IPv6 only networking")
+		s.isIPv6Only = true
+		s.Networks = []string{"bridge-ipv6"}
+		s.AirgapImageBundleMountPoints = []string{"/var/lib/k0s/images/bundle.tar"}
+		s.K0sExtraImageBundleMountPoints = []string{"/var/lib/k0s/images/ipv6.tar"}
+	}
+	suite.Run(t, &s)
+}
+
+// Writes the given objects as YAML manifests to path on the first controller.
+func (s *KubeRouterHairpinSuite) putManifests(path string, obj ...runtime.Object) {
+	codec := applier.CodecFor(scheme.Scheme)
+	var buf bytes.Buffer
+	for _, obj := range obj {
+		buf.WriteString("---\n")
+		s.Require().NoError(codec.Encode(obj, &buf))
+		buf.WriteByte('\n')
+	}
+	s.WriteFileContent(s.ControllerNode(0), path, buf.Bytes())
+}
+
+// A pod serving HTTP that tries to reach itself, exposed via a service
+func (s *KubeRouterHairpinSuite) hairpinApp() []runtime.Object {
+	appLabels := map[string]string{"app.kubernetes.io/name": "hairpin"}
+	alpineImage, err := ociimages.Alpine(s.Context())
+	s.Require().NoError(err)
+
+	return []runtime.Object{
+		&corev1.Pod{
+			Name:      "hairpin-pod",
+			Namespace: metav1.NamespaceDefault,
+			Labels:    appLabels,
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:  "nginx",
+					Image: ociimages.Nginx,
+					Ports: []corev1.ContainerPort{{ContainerPort: 80}},
+				}, {
+					Name:    "wget",
+					Image:   alpineImage,
+					Command: []string{"sleep", "infinity"},
+				}},
+			},
+		},
+		&corev1.Service{
+			Name:      "hairpin",
+			Namespace: metav1.NamespaceDefault,
+			Spec: corev1.ServiceSpec{
+				Selector: appLabels,
+				Ports: []corev1.ServicePort{{
+					Protocol:   corev1.ProtocolTCP,
+					Port:       80,
+					TargetPort: intstr.FromInt32(80),
+				}},
+			},
+		},
+	}
+}

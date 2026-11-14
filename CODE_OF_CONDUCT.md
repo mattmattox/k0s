@@ -1,3 +1,10 @@
-# k0s Community Code Of Conduct
+<!--
+SPDX-FileCopyrightText: 2020 k0s authors
+SPDX-License-Identifier: CC-BY-SA-4.0
+-->
 
-Please refer to our [contributor code of conduct](contributors/CODE_OF_CONDUCT.md).
+# Code of conduct
+
+K0s follows the k0sproject community's code of conduct:
+
+<https://github.com/k0sproject/community/blob/main/CODE_OF_CONDUCT.md>

@@ -1,0 +1,833 @@
+// SPDX-FileCopyrightText: 2024 k0s authors
+// SPDX-License-Identifier: Apache-2.0
+
+package controller
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/avast/retry-go"
+	etcdv1beta1 "github.com/k0sproject/k0s/pkg/apis/etcd/v1beta1"
+	"github.com/k0sproject/k0s/pkg/apis/k0s/v1beta1"
+	etcdclient "github.com/k0sproject/k0s/pkg/client/clientset/typed/etcd/v1beta1"
+	"github.com/k0sproject/k0s/pkg/component/controller/leaderelector"
+	"github.com/k0sproject/k0s/pkg/component/manager"
+	"github.com/k0sproject/k0s/pkg/config"
+	"github.com/k0sproject/k0s/pkg/etcd"
+	kubeutil "github.com/k0sproject/k0s/pkg/kubernetes"
+	"github.com/k0sproject/k0s/pkg/kubernetes/watch"
+	"github.com/k0sproject/k0s/pkg/leaderelection"
+	"github.com/sirupsen/logrus"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
+	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	apitypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/wait"
+	nodeutil "k8s.io/component-helpers/node/util"
+)
+
+const (
+	controllerLeaseAnnotationName = "k0s.k0sproject.io/controller-lease"
+	// Deprecated: Stop writing and reading the label in k0s 1.38+.
+	controllerLeaseLabelName = controllerLeaseAnnotationName
+	shutdownOnLeaveLabelName = "k0s.k0sproject.io/shutdown-on-leave"
+	shutdownLabelName        = "k0s.k0sproject.io/shutdown"
+)
+
+const EtcdMemberStackName = "etcd-member"
+
+var _ manager.Component = (*EtcdMemberReconciler)(nil)
+
+func NewEtcdMemberReconciler(kubeClientFactory kubeutil.ClientFactoryInterface, nodeName apitypes.NodeName, k0sVars *config.CfgVars, etcdConfig *v1beta1.EtcdConfig, leaderElector leaderelector.Interface, controllerCount func() uint, leaveOnStop func(bool), shutdown context.CancelCauseFunc) (*EtcdMemberReconciler, error) {
+
+	return &EtcdMemberReconciler{
+		clientFactory:   kubeClientFactory,
+		nodeName:        nodeName,
+		k0sVars:         k0sVars,
+		etcdConfig:      etcdConfig,
+		leaderElector:   leaderElector,
+		controllerCount: controllerCount,
+		leaveOnStop:     leaveOnStop,
+		shutdown:        shutdown,
+	}, nil
+}
+
+type EtcdMemberReconciler struct {
+	clientFactory   kubeutil.ClientFactoryInterface
+	k0sVars         *config.CfgVars
+	etcdConfig      *v1beta1.EtcdConfig
+	leaderElector   leaderelector.Interface
+	controllerCount func() uint
+	nodeName        apitypes.NodeName
+	leaveOnStop     func(bool)
+	shutdown        context.CancelCauseFunc
+	stop            func()
+}
+
+// Init implements [manager.Component].
+func (e *EtcdMemberReconciler) Init(_ context.Context) error {
+	return nil
+}
+
+// Reconciles every EtcdMember object against the live etcd cluster state. This
+// avoids stale state after leader changes, especially when the leader removes
+// itself and can no longer update its own EtcdMember status.
+func (e *EtcdMemberReconciler) resync(ctx context.Context, client etcdclient.EtcdMemberInterface, log logrus.FieldLogger) bool {
+	members, err := func() (*etcdv1beta1.EtcdMemberList, error) {
+		// Use high timeout as etcd/api could be a bit slow when the leader changes
+		ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+		defer cancel()
+		return client.List(ctx, metav1.ListOptions{})
+	}()
+	if err != nil {
+		log.WithError(err).Error("Failed to list etcd members")
+		return false
+	}
+
+	etcdClient, clusterMembers, err := e.listEtcdClusterMembers(ctx)
+	if err != nil {
+		log.WithError(err).Error("Failed to list etcd cluster members")
+		msg := "Failed to list etcd cluster members: " + err.Error()
+
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		var wg sync.WaitGroup
+		for _, member := range members.Items {
+			wg.Go(func() {
+				member.Status.ReconcileStatus = etcdv1beta1.ReconcileStatusFailed
+				member.Status.Message = msg
+				if _, err := client.UpdateStatus(ctx, &member, metav1.UpdateOptions{}); err != nil {
+					log.WithFields(logrus.Fields{
+						"name":        member.Name,
+						"memberID":    member.Status.MemberID,
+						"peerAddress": member.Status.PeerAddress,
+					}).WithError(err).Error("Failed to update EtcdMember status")
+				}
+			})
+		}
+
+		wg.Wait()
+		return false
+	}
+	defer etcdClient.Close()
+
+	// Loop through all the members and reconcile them
+	var failed bool
+	for _, member := range members.Items {
+		if !e.reconcileMember(ctx, etcdClient, client, clusterMembers, &member) {
+			failed = true
+		}
+	}
+
+	if !e.promoteLearners(ctx, client, members.Items, log) {
+		failed = true
+	}
+
+	return !failed
+}
+
+func (e *EtcdMemberReconciler) listEtcdClusterMembers(ctx context.Context) (_ *etcd.Client, _ []etcd.Member, err error) {
+	client, err := etcd.NewClient(e.k0sVars.CertRootDir, e.k0sVars.EtcdCertDir, e.etcdConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create etcd client: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, client.Close())
+		}
+	}()
+
+	// Use high timeout as etcd could be a bit slow when the leader changes
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+	defer cancel()
+
+	members, err := client.ListMembers(ctx)
+	return client, members, err
+}
+
+// Waits for CRDs, creates this node's EtcdMember, and launches the reconcile loop.
+func (e *EtcdMemberReconciler) Start(ctx context.Context) error {
+	log := logrus.WithField("component", "etcdMemberReconciler")
+
+	err := e.waitForCRD(ctx)
+	if err != nil {
+		return fmt.Errorf("didn't see EtcdMember CRD ready in time: %w", err)
+	}
+
+	client, err := e.clientFactory.GetEtcdMemberClient()
+	if err != nil {
+		return err
+	}
+
+	// Create the object for this node
+	// Need to be done in retry loop as during the initial startup the etcd might not be stable
+	err = retry.Do(
+		func() error {
+			return e.createMemberObject(ctx, client)
+		},
+		retry.Delay(3*time.Second),
+		retry.Attempts(5),
+		retry.Context(ctx),
+		retry.LastErrorOnly(true),
+		retry.RetryIf(func(retryErr error) bool {
+			log.Debugf("retrying createMemberObject: %v", retryErr)
+			// During etcd cluster bootstrap, it's common to see k8s giving 500 errors due to etcd timeouts
+			return apierrors.IsInternalError(retryErr)
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create EtcdMember object for this controller: %w", err)
+	}
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		e.reconcile(ctx, log, client)
+	}()
+
+	e.stop = func() {
+		cancel(errors.New("etcd member reconciler is stopping"))
+		<-done
+	}
+
+	return nil
+}
+
+// Drives the leader-aware control loop: leaders watch/resync members, followers
+// only wait for a shutdown signal and yield to the leader on changes.
+func (e *EtcdMemberReconciler) reconcile(ctx context.Context, log logrus.FieldLogger, client etcdclient.EtcdMemberInterface) {
+	for {
+		status, statusExpired := e.leaderElector.CurrentStatus()
+		statusCtx, cancelStatus := context.WithCancelCause(ctx)
+
+		go func() {
+			select {
+			case <-statusExpired:
+				// Cancel the reconciliation on leader status changes and
+				// enforce a new loop iteration.
+				cancelStatus(errors.New("leader status changed"))
+			case <-statusCtx.Done():
+			}
+		}()
+
+		switch status {
+		case leaderelection.StatusLeading:
+			e.watchAndResync(statusCtx, client, log)
+
+		case leaderelection.StatusPending:
+			e.shutdownIfMarked(statusCtx, log, client)
+		}
+
+		// Bail out if the context has been canceled.
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// Short-circuit to the next loop iteration on leader status changes.
+		select {
+		case <-statusCtx.Done():
+			continue
+		default:
+		}
+
+		// Reconciliation exited early, probably due to an error. Back off and restart.
+		cancelStatus(nil)
+		select {
+		case <-time.After(30 * time.Second):
+			continue
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// Runs a watch that triggers a full resync; retries resync on failure. This
+// balances prompt reactions to events with a full reconciliation.
+func (e *EtcdMemberReconciler) watchAndResync(ctx context.Context, client etcdclient.EtcdMemberInterface, log logrus.FieldLogger) {
+	log.Info("Starting to watch and resync etcd member objects")
+
+	trigger := make(chan struct{}, 1)
+	go e.watchEtcdMembers(ctx, client, log, trigger)
+
+	// Resync periodically even when no EtcdMember CR changes. Learners
+	// that join before their own controller is ready never have a matching
+	// CR, so the watch alone would never fire for them.
+	var resync <-chan time.Time
+	for {
+		e.resync(ctx, client, log)
+		resync = time.After(wait.Jitter(10*time.Second, 0.1))
+
+		select {
+		case <-resync:
+		case _, ok := <-trigger:
+			if !ok {
+				// The trigger goroutine exited. Return and wait for a restart.
+				return
+			}
+		case <-ctx.Done():
+			for range trigger {
+				// Wait for trigger goroutine to exit.
+			}
+			return
+		}
+	}
+}
+
+// Watches EtcdMember objects and signals when any change occurs. The reconciler
+// uses the trigger to kick off a resync rather than handling per-event deltas.
+func (e *EtcdMemberReconciler) watchEtcdMembers(ctx context.Context, client etcdclient.EtcdMemberInterface, log logrus.FieldLogger, trigger chan<- struct{}) {
+	defer close(trigger)
+
+	var lastObservedVersion string
+	err := watch.EtcdMembers(client).
+		WithErrorCallback(func(err error) (time.Duration, error) {
+			retryDelay, e := watch.IsRetryable(err)
+			if e == nil {
+				log.WithError(err).Debugf(
+					"Encountered transient error while watching etcd members"+
+						", last observed resource version was %q"+
+						", retrying in %s",
+					lastObservedVersion, retryDelay,
+				)
+				return retryDelay, nil
+			}
+			log.WithError(e).Error("bailing out watch")
+			return 0, err
+		}).
+		Until(ctx, func(member *etcdv1beta1.EtcdMember) (bool, error) {
+			lastObservedVersion = member.ResourceVersion
+			log.Debugf("watch triggered on %s", member.Name)
+			select {
+			case trigger <- struct{}{}:
+			default:
+			}
+			// Never stop the watch
+			return false, nil
+		})
+
+	if canceled := context.Cause(ctx); errors.Is(err, canceled) {
+		log.WithError(err).Info("Watch terminated")
+	} else {
+		log.WithError(err).Error("Watch terminated unexpectedly")
+	}
+}
+
+// Waits for the shutdown label on this member and then requests a k0s shutdown.
+func (e *EtcdMemberReconciler) shutdownIfMarked(ctx context.Context, log logrus.FieldLogger, client etcdclient.EtcdMemberInterface) {
+	name := e.etcdConfig.GetMemberName()
+	name, err := nodeutil.GetHostname(name)
+	if err != nil {
+		log.WithError(err).Error("Failed to get name for etcd member")
+		return
+	}
+
+	log.Info("Starting to watch etcd member object ", name, " using invocation ID ", e.k0sVars.InvocationID)
+	var leave bool
+	err = watch.EtcdMembers(client).
+		WithObjectName(name).
+		WithLabels(labels.Set{shutdownLabelName: e.k0sVars.InvocationID}).
+		Until(ctx, func(m *etcdv1beta1.EtcdMember) (bool, error) {
+			leave = m.Spec.Leave
+			return true, nil
+		})
+
+	if err == nil {
+		log.Info("Etcd member marked for shutdown; stopping components and waiting for external termination")
+		if leave {
+			e.leaveOnStop(true)
+			log.Info("Will leave etcd cluster before shutting down")
+			e.shutdown(errors.New("etcd member marked for leave and shutdown"))
+		} else {
+			e.shutdown(errors.New("etcd member marked for shutdown"))
+		}
+	} else if ctxErr := context.Cause(ctx); !errors.Is(err, ctxErr) {
+		log.WithError(err).Error("Error watching etcd member object")
+	}
+}
+
+// Cancels the reconcile loop and waits for it to exit.
+func (e *EtcdMemberReconciler) Stop() error {
+	if e.stop != nil {
+		e.stop()
+	}
+	return nil
+}
+
+// Blocks until the EtcdMember CRD is established so the controller can safely
+// create/watch EtcdMember resources.
+func (e *EtcdMemberReconciler) waitForCRD(ctx context.Context) error {
+	ctx, cancel := context.WithTimeoutCause(ctx, 2*time.Minute, errors.New("EtcdMember CRD did not become established in time"))
+	defer cancel()
+
+	client, err := e.clientFactory.GetAPIExtensionsClient()
+	if err != nil {
+		return err
+	}
+	var lastObservedVersion string
+	log := logrus.WithField("component", "etcdMemberReconciler")
+	log.Info("waiting to see EtcdMember CRD ready")
+	return watch.CRDs(client.ApiextensionsV1().CustomResourceDefinitions()).
+		WithObjectName(fmt.Sprintf("%s.%s", "etcdmembers", "etcd.k0sproject.io")).
+		WithErrorCallback(func(err error) (time.Duration, error) {
+			if retryAfter, e := watch.IsRetryable(err); e == nil {
+				log.WithError(err).Infof(
+					"Transient error while watching etcdmember CRD"+
+						", last observed version is %q"+
+						", starting over after %s ...",
+					lastObservedVersion, retryAfter,
+				)
+				return retryAfter, nil
+			}
+
+			retryAfter := 10 * time.Second
+			log.WithError(err).Errorf(
+				"Failed to watch for etcdmember CRD"+
+					", last observed version is %q"+
+					", starting over after %s ...",
+				lastObservedVersion, retryAfter,
+			)
+			return retryAfter, nil
+		}).
+		Until(ctx, func(item *apiextensionsv1.CustomResourceDefinition) (bool, error) {
+			lastObservedVersion = item.ResourceVersion
+			for _, cond := range item.Status.Conditions {
+				if cond.Type == apiextensionsv1.Established {
+					log.Infof("EtcdMember CRD status: %s", cond.Status)
+					return cond.Status == apiextensionsv1.ConditionTrue, nil
+				}
+			}
+
+			return false, nil
+		})
+
+}
+
+// Ensures there's an EtcdMember object for this controller node, stamping
+// identity/labels so other controllers can coordinate safe leave/shutdown
+// flows.
+func (e *EtcdMemberReconciler) createMemberObject(ctx context.Context, client etcdclient.EtcdMemberInterface) error {
+	log := logrus.WithFields(logrus.Fields{"component": "etcdMemberReconciler", "phase": "createMemberObject"})
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	// find the member ID for this node
+	etcdClient, err := etcd.NewClient(e.k0sVars.CertRootDir, e.k0sVars.EtcdCertDir, e.etcdConfig)
+	if err != nil {
+		return err
+	}
+	defer etcdClient.Close()
+
+	// The local etcd has already passed its health check by the time this
+	// runs (a learner can't serve linearizable reads), so the member is
+	// guaranteed to be voting here. Stamp Joined=True unconditionally.
+	memberStatus, err := etcdClient.Status(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Convert the memberID to hex string
+	memberIDStr := strconv.FormatUint(memberStatus.ID, 16)
+	memberName := e.etcdConfig.GetMemberName()
+	name, err := nodeutil.GetHostname(memberName)
+	if err != nil {
+		return fmt.Errorf("failed to get name for etcd member: %w", err)
+	}
+	var em *etcdv1beta1.EtcdMember
+
+	log.WithField("name", name).WithField("memberID", memberIDStr).Info("creating EtcdMember object")
+
+	controllerLeaseName := fmt.Sprintf("k0s-ctrl-%s", e.nodeName)
+	memberLabels := labels.Set{shutdownOnLeaveLabelName: e.k0sVars.InvocationID}
+	// Controllers that don't know about the annotation rely on the label.
+	// Set it for them whenever the lease name fits into a label value.
+	if len(validation.IsValidLabelValue(controllerLeaseName)) == 0 {
+		memberLabels[controllerLeaseLabelName] = controllerLeaseName
+	}
+
+	// Check if the object already exists
+	em, err = client.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Debug("EtcdMember object not found, creating it")
+			em = &etcdv1beta1.EtcdMember{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: name,
+					Annotations: map[string]string{
+						controllerLeaseAnnotationName: controllerLeaseName,
+					},
+					Labels: memberLabels,
+				},
+				Spec: etcdv1beta1.EtcdMemberSpec{
+					Leave: false,
+				},
+			}
+
+			em, err = client.Create(ctx, em, metav1.CreateOptions{})
+			if err != nil {
+				return err
+			}
+			em.Status = etcdv1beta1.Status{
+				PeerAddress: e.etcdConfig.PeerAddress,
+				MemberID:    memberIDStr,
+			}
+			em.Status.SetCondition(etcdv1beta1.ConditionTypeJoined, etcdv1beta1.ConditionTrue, "Member joined", time.Now())
+			if _, err := client.UpdateStatus(ctx, em, metav1.UpdateOptions{}); err != nil {
+				log.WithError(err).Error("Failed to update EtcdMember status")
+			}
+			return nil
+		} else {
+			return err
+		}
+	}
+
+	metav1.SetMetaDataAnnotation(&em.ObjectMeta, controllerLeaseAnnotationName, controllerLeaseName)
+	em.Labels = labels.Merge(em.Labels, memberLabels)
+	delete(em.Labels, shutdownLabelName) // Clear any lingering shutdown request on re-join.
+	em.Spec.Leave = false
+
+	log.Debug("EtcdMember object already exists, updating it")
+	// Update the object if it already exists
+	em, err = client.Update(ctx, em, metav1.UpdateOptions{})
+	if err != nil {
+		return err
+	}
+	em.Status.PeerAddress = e.etcdConfig.PeerAddress
+	em.Status.MemberID = memberIDStr
+	em.Status.SetCondition(etcdv1beta1.ConditionTypeJoined, etcdv1beta1.ConditionTrue, "Member joined", time.Now())
+	if _, err := client.UpdateStatus(ctx, em, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("failed to update EtcdMember status: %w", err)
+	}
+
+	return nil
+}
+
+// Applies the leave/shutdown protocol for a single EtcdMember. It prevents the
+// last controller from leaving, waits for active controllers to stop, then
+// removes the etcd member and updates status accordingly.
+func (e *EtcdMemberReconciler) reconcileMember(ctx context.Context, etcdClient *etcd.Client, client etcdclient.EtcdMemberInterface, clusterMembers []etcd.Member, member *etcdv1beta1.EtcdMember) bool {
+	log := logrus.WithFields(logrus.Fields{
+		"component":   "etcdMemberReconciler",
+		"phase":       "reconcile",
+		"name":        member.Name,
+		"memberID":    member.Status.MemberID,
+		"peerAddress": member.Status.PeerAddress,
+	})
+
+	log.Debugf("reconciling EtcdMember: %s", member.Name)
+
+	// Convert the memberID to uint64
+	memberID, err := strconv.ParseUint(member.Status.MemberID, 16, 64)
+	if err != nil {
+		log.WithError(err).Error("Failed to parse memberID")
+		member.Status.ReconcileStatus = etcdv1beta1.ReconcileStatusFailed
+		member.Status.Message = "Failed to parse memberID: " + err.Error()
+		if _, err := client.UpdateStatus(ctx, member, metav1.UpdateOptions{}); err != nil {
+			log.WithError(err).Error("Failed to update EtcdMember status")
+		}
+
+		return false
+	}
+
+	exists := slices.ContainsFunc(clusterMembers, func(m etcd.Member) bool {
+		return m.ID == memberID
+	})
+
+	// Member not listed as etcd member.
+	if !exists {
+		for i := range member.Status.Conditions {
+			c := &member.Status.Conditions[i]
+			if c.Type == etcdv1beta1.ConditionTypeJoined {
+				if c.Status == etcdv1beta1.ConditionFalse {
+					return true
+				}
+				break
+			}
+		}
+
+		msg := "No such member ID"
+		log.Debug(msg)
+		member.Status.Message = msg
+		member.Status.SetCondition(etcdv1beta1.ConditionTypeJoined, etcdv1beta1.ConditionFalse, member.Status.Message, time.Now())
+		member.Status.ReconcileStatus = etcdv1beta1.ReconcileStatusSuccess
+		if _, err := client.UpdateStatus(ctx, member, metav1.UpdateOptions{}); err != nil {
+			log.WithError(err).Error("Failed to update EtcdMember status")
+			return false
+		}
+		return true
+	}
+
+	if !member.Spec.Leave {
+		log.Debug("member not marked for leave, no action needed")
+		return true
+	}
+
+	if e.etcdConfig.PeerAddress == member.Status.PeerAddress {
+		if count := e.controllerCount(); count < 2 {
+			msg := "The only active controller cannot leave the etcd cluster" +
+				"; either bring another controller online or clear spec.leave"
+			log.Error(msg)
+			member.Status.Message = msg
+			member.Status.ReconcileStatus = ""
+			if _, err := client.UpdateStatus(ctx, member, metav1.UpdateOptions{}); err != nil {
+				log.WithError(err).Error("Failed to update EtcdMember status")
+			}
+			return false
+		}
+
+		if le, ok := e.leaderElector.(interface{ YieldLease() }); ok {
+			msg := "Waiting for another controller to take over"
+			log.Info(msg)
+			member.Status.Message = msg
+			member.Status.ReconcileStatus = ""
+			if _, err := client.UpdateStatus(ctx, member, metav1.UpdateOptions{}); err != nil {
+				log.WithError(err).Error("Failed to update EtcdMember status")
+			}
+			le.YieldLease()
+		} else {
+			msg := "Requested to leave the etcd cluster, but cannot yield the lease"
+			log.Error(msg)
+			member.Status.Message = msg
+			member.Status.ReconcileStatus = etcdv1beta1.ReconcileStatusFailed
+			if _, err := client.UpdateStatus(ctx, member, metav1.UpdateOptions{}); err != nil {
+				log.WithError(err).Error("Failed to update EtcdMember status")
+			}
+		}
+
+		return false
+	}
+
+	joinStatus := member.Status.GetCondition(etcdv1beta1.ConditionTypeJoined)
+	if joinStatus != nil && joinStatus.Status == etcdv1beta1.ConditionFalse && !exists {
+		log.Debug("member already left, no action needed")
+		return true
+	}
+
+	if memberInvocationID, ok := member.Labels[shutdownOnLeaveLabelName]; ok && memberInvocationID != "" {
+		clients, err := e.clientFactory.GetClient()
+		if err != nil {
+			log.WithError(err).Error("Failed to get Kubernetes client")
+			return false
+		}
+
+		memberLeaseName := cmp.Or(
+			member.Annotations[controllerLeaseAnnotationName],
+			member.Labels[controllerLeaseLabelName],
+			"k0s-ctrl-"+member.Name,
+		)
+		if memberLease, err := clients.CoordinationV1().Leases(corev1.NamespaceNodeLease).Get(ctx, memberLeaseName, metav1.GetOptions{}); err != nil {
+			log.WithError(err).Error("Failed to get k0s controller lease")
+			msg := "Failed to get k0s controller lease: " + err.Error()
+			if apierrors.IsNotFound(err) {
+				msg = "No k0s controller lease found"
+			}
+			member.Status.Message = msg
+			member.Status.ReconcileStatus = ""
+			if _, err := client.UpdateStatus(ctx, member, metav1.UpdateOptions{}); err != nil {
+				log.WithError(err).Error("Failed to update EtcdMember status")
+			}
+			return false
+		} else if kubeutil.IsValidLease(*memberLease) {
+			msg := "Member is still active; waiting for it to shutdown"
+			if ident := memberLease.Spec.HolderIdentity; ident != nil && *ident == memberInvocationID {
+				if member.Labels[shutdownLabelName] != memberInvocationID {
+					log.Info("Requesting member shutdown before deletion")
+					member.Labels[shutdownLabelName] = memberInvocationID
+					if _, err := client.Update(ctx, member, metav1.UpdateOptions{}); err != nil {
+						log.WithError(err).Error("Failed to update EtcdMember")
+						return false
+					}
+					return true
+				}
+			} else {
+				msg = "Unexpected lease holder"
+			}
+
+			log.Info(msg)
+			member.Status.Message = msg
+			member.Status.ReconcileStatus = ""
+			if _, err := client.UpdateStatus(ctx, member, metav1.UpdateOptions{}); err != nil {
+				log.WithError(err).Error("Failed to update member state")
+			}
+			return false
+		} else if memberLease.Spec.RenewTime != nil && time.Since(memberLease.Spec.RenewTime.Time) < 5*time.Minute {
+			// The lease has only just been released.
+			// Give some time for the self-leave to take place.
+			msg := "Member is offline; waiting for it to leave"
+			log.Info(msg)
+			member.Status.Message = msg
+			member.Status.ReconcileStatus = ""
+			if _, err := client.UpdateStatus(ctx, member, metav1.UpdateOptions{}); err != nil {
+				log.WithError(err).Error("Failed to update EtcdMember status")
+			}
+			return false
+		}
+	}
+
+	log.Debug("Deleting member from cluster")
+	err = retry.Do(func() error {
+		return etcdClient.DeleteMember(ctx, memberID)
+	},
+		retry.Delay(5*time.Second),
+		retry.LastErrorOnly(true),
+		retry.Attempts(5),
+		retry.Context(ctx),
+		retry.RetryIf(func(err error) bool {
+			// In case etcd reports unhealthy cluster, retry
+			msg := err.Error()
+			switch {
+			case strings.Contains(msg, "unhealthy cluster"):
+				return true
+			case strings.Contains(msg, "leader changed"):
+				return true
+			}
+			return false
+		}),
+	)
+
+	if err != nil {
+		log.WithError(err).Error("Failed to delete member from cluster")
+		member.Status.ReconcileStatus = etcdv1beta1.ReconcileStatusFailed
+		member.Status.Message = "Failed to delete member from cluster: " + err.Error()
+		if _, err := client.UpdateStatus(ctx, member, metav1.UpdateOptions{}); err != nil {
+			log.WithError(err).Error("Failed to update EtcdMember status")
+		}
+		return false
+	}
+
+	// Peer removed successfully, update status
+	log.Info("Member has been deleted from cluster")
+	member.Status.ReconcileStatus = etcdv1beta1.ReconcileStatusSuccess
+	member.Status.Message = "Member removed from cluster"
+	member.Status.SetCondition(etcdv1beta1.ConditionTypeJoined, etcdv1beta1.ConditionFalse, member.Status.Message, time.Now())
+	if _, err := client.UpdateStatus(ctx, member, metav1.UpdateOptions{}); err != nil {
+		log.WithError(err).Error("Failed to update EtcdMember status")
+		return false
+	}
+
+	return true
+}
+
+// promoteLearners walks the etcd member list and tries to promote at most
+// one learner per call to a voting member. On success, the matching
+// EtcdMember CR's Joined condition is flipped to True — "Joined" only
+// becomes True once the member is a full voting peer, not while it's still
+// a non-voting learner.
+//
+// Promoting gradually (one per tick) keeps raft config changes serialized.
+// Members are shuffled so that successive ticks don't retry the same stuck
+// learner first.
+//
+// Called only from resync, which only runs when this controller holds the
+// leader lease.
+func (e *EtcdMemberReconciler) promoteLearners(
+	ctx context.Context,
+	client etcdclient.EtcdMemberInterface,
+	crs []etcdv1beta1.EtcdMember,
+	log logrus.FieldLogger,
+) bool {
+	etcdClient, err := etcd.NewClient(e.k0sVars.CertRootDir, e.k0sVars.EtcdCertDir, e.etcdConfig)
+	if err != nil {
+		log.WithError(err).Warn("failed to create etcd client for learner promotion")
+		return false
+	}
+	defer etcdClient.Close()
+
+	members, err := etcdClient.ListMembers(ctx)
+	if err != nil {
+		log.WithError(err).Warn("failed to list etcd members")
+		return false
+	}
+
+	crByName := make(map[string]*etcdv1beta1.EtcdMember, len(crs))
+	for i := range crs {
+		crByName[crs[i].Name] = &crs[i]
+	}
+
+	rand.Shuffle(len(members), func(i, j int) { members[i], members[j] = members[j], members[i] })
+
+	for _, m := range members {
+		if !m.IsLearner {
+			continue
+		}
+		log := log.WithFields(logrus.Fields{
+			"memberID":   strconv.FormatUint(m.ID, 16),
+			"memberName": m.Name,
+		})
+
+		if m.Name == "" {
+			// etcdctl reports this state as "unstarted": the member has
+			// been added to the cluster but hasn't reported its name back
+			// yet. Try another learner on this tick.
+			log.Debug("member is unstarted, skipping")
+			continue
+		}
+
+		// The matching CR may not exist yet — the joining controller
+		// creates it only after its own etcd component reports ready,
+		// which can't happen while it is a learner (a learner cannot
+		// serve the readiness Range). We still attempt promotion; CR
+		// status is updated only when the CR exists.
+		cr := crByName[m.Name]
+
+		switch err := etcdClient.PromoteMember(ctx, m.ID); {
+		case err == nil:
+			log.Info("promoted learner to voting member")
+			e.setJoined(ctx, client, cr, log)
+			return true
+
+		case errors.Is(err, rpctypes.ErrMemberNotLearner):
+			// Race: someone else promoted it. Treat as success.
+			log.Debug("member already promoted")
+			e.setJoined(ctx, client, cr, log)
+			return true
+
+		case errors.Is(err, rpctypes.ErrMemberLearnerNotReady):
+			log.Debug("learner not ready for promotion yet")
+			// Pending learner — return false so resync re-runs in 10s.
+			return false
+
+		default:
+			log.WithError(err).Warn("failed to promote learner")
+			return false
+		}
+	}
+
+	return true
+}
+
+// setJoined stamps ConditionTypeJoined=True on the CR once the member has
+// been promoted to voting. No-op if the CR is nil or already shows True.
+func (e *EtcdMemberReconciler) setJoined(
+	ctx context.Context,
+	client etcdclient.EtcdMemberInterface,
+	cr *etcdv1beta1.EtcdMember,
+	log logrus.FieldLogger,
+) {
+	if cr == nil {
+		return
+	}
+	existing := cr.Status.GetCondition(etcdv1beta1.ConditionTypeJoined)
+	if existing != nil && existing.Status == etcdv1beta1.ConditionTrue {
+		return
+	}
+	cr.Status.SetCondition(etcdv1beta1.ConditionTypeJoined, etcdv1beta1.ConditionTrue, "Member joined", time.Now())
+	if _, err := client.UpdateStatus(ctx, cr, metav1.UpdateOptions{}); err != nil {
+		log.WithError(err).Warn("failed to update Joined condition")
+	}
+}

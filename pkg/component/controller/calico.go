@@ -1,63 +1,97 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2020 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package controller
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"io/fs"
+	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/k0sproject/k0s/pkg/apis/k0s/v1beta1"
+	"github.com/k0sproject/k0s/pkg/component/manager"
+	"github.com/k0sproject/k0s/pkg/constant"
 
 	"github.com/k0sproject/k0s/static"
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/k0sproject/k0s/internal/util"
-	config "github.com/k0sproject/k0s/pkg/apis/v1beta1"
+	"github.com/k0sproject/k0s/internal/pkg/dir"
+	"github.com/k0sproject/k0s/internal/pkg/file"
+	k0snet "github.com/k0sproject/k0s/internal/pkg/net"
+	"github.com/k0sproject/k0s/internal/pkg/templatewriter"
+	"github.com/k0sproject/k0s/internal/sync/value"
 )
+
+// Dummy checks so we catch easily if we miss some interface implementation
+var _ manager.Component = (*Calico)(nil)
+var _ manager.Reconciler = (*Calico)(nil)
+
+var calicoCRDOnce sync.Once
 
 // Calico is the Component interface implementation to manage Calico
 type Calico struct {
-	clusterConf *config.ClusterConfig
-	tickerDone  chan struct{}
-	log         *logrus.Entry
+	log                  logrus.FieldLogger
+	nodeConfig           calicoNodeConfig
+	primaryAddressFamily v1beta1.PrimaryAddressFamilyType
+	manifestsDir         string
+	hasWindowsNodes      func() (*bool, <-chan struct{})
 
-	crdSaver manifestsSaver
-	saver    manifestsSaver
+	config value.Latest[*calicoReconcileConfig]
+	stop   func()
 }
 
-type manifestsSaver interface {
-	Save(dst string, content []byte) error
+// calicoReconcileConfig bundles everything a reconcile depends on. It's held in
+// a single [value.Latest] so that a change to any part of it -- including the
+// patches -- triggers a re-render. Keeping patches outside this value would
+// make patch-only changes invisible to the change detection.
+type calicoReconcileConfig struct {
+	cluster *calicoClusterConfig
+	patches v1beta1.Patches
 }
+
+type calicoMode string
+
+const (
+	calicoModeBIRD  calicoMode = "bird"
+	calicoModeVXLAN calicoMode = "vxlan"
+)
 
 type calicoConfig struct {
+	*calicoNodeConfig
+	*calicoClusterConfig
+	IncludeWindows bool
+}
+
+type calicoNodeConfig struct {
+	APIServer       *k0snet.HostPort
+	ServiceCIDRIPv4 string
+	ClusterCIDRIPv4 string
+	ClusterCIDRIPv6 string
+	ClusterDNSIP    string
+}
+
+type calicoClusterConfig struct {
 	MTU                  int
-	Mode                 string
+	Mode                 calicoMode
 	VxlanPort            int
 	VxlanVNI             int
-	ClusterCIDRIPv4      string
-	ClusterCIDRIPv6      string
 	EnableWireguard      bool
-	WithWindowsNodes     bool
 	FlexVolumeDriverPath string
-	DualStack            bool
+	EnableIPv4           bool
+	EnableIPv6           bool
+	EnvVars              map[string]string
 
 	CalicoCNIImage             string
+	CalicoCNIWindowsImage      string
 	CalicoNodeImage            string
+	CalicoNodeWindowsImage     string
 	CalicoKubeControllersImage string
 	Overlay                    string
 	IPAutodetectionMethod      string
@@ -66,171 +100,285 @@ type calicoConfig struct {
 }
 
 // NewCalico creates new Calico reconciler component
-func NewCalico(clusterConf *config.ClusterConfig, crdSaver manifestsSaver, manifestsSaver manifestsSaver) (*Calico, error) {
-	log := logrus.WithFields(logrus.Fields{"component": "calico"})
+func NewCalico(nodeConfig *v1beta1.ClusterConfig, manifestsDir string, hasWindowsNodes func() (*bool, <-chan struct{})) (*Calico, error) {
+	dnsAddress, err := nodeConfig.Spec.Network.DNSAddress(nodeConfig.Spec.PrimaryAddressFamily())
+	if err != nil {
+		return nil, err
+	}
+
+	apiServer, err := nodeConfig.Spec.API.APIServerHostPort()
+	if err != nil {
+		return nil, err
+	}
+
+	calicoNodeConfig := calicoNodeConfig{
+		APIServer:       apiServer,
+		ServiceCIDRIPv4: nodeConfig.Spec.Network.ServiceCIDR,
+		ClusterDNSIP:    dnsAddress,
+	}
+	primaryAddressFamily := nodeConfig.Spec.PrimaryAddressFamily()
+	if nodeConfig.Spec.Network.DualStack.Enabled {
+		calicoNodeConfig.ClusterCIDRIPv4 = nodeConfig.Spec.Network.PodCIDR
+		calicoNodeConfig.ClusterCIDRIPv6 = nodeConfig.Spec.Network.DualStack.IPv6PodCIDR
+	} else if primaryAddressFamily == v1beta1.PrimaryFamilyIPv4 {
+		calicoNodeConfig.ClusterCIDRIPv4 = nodeConfig.Spec.Network.PodCIDR
+	} else {
+		calicoNodeConfig.ClusterCIDRIPv6 = nodeConfig.Spec.Network.PodCIDR
+	}
+
 	return &Calico{
-		clusterConf: clusterConf,
-		log:         log,
-		crdSaver:    crdSaver,
-		saver:       manifestsSaver,
+		log:                  logrus.WithFields(logrus.Fields{"component": "calico"}),
+		nodeConfig:           calicoNodeConfig,
+		primaryAddressFamily: primaryAddressFamily,
+		manifestsDir:         manifestsDir,
+		hasWindowsNodes:      hasWindowsNodes,
 	}, nil
 }
 
-// Init does nothing
-func (c *Calico) Init() error {
+// Init implements [manager.Component].
+func (c *Calico) Init(context.Context) error {
 	return nil
 }
 
-// Run runs the calico reconciler
-func (c *Calico) Run() error {
-	c.tickerDone = make(chan struct{})
-	var emptyStruct struct{}
-
-	// Write the CRD definitions only at "boot", they do not change during runtime
-	crds, err := static.AssetDir("manifests/calico/CustomResourceDefinition")
-
-	if err != nil {
-		return err
-	}
-
-	for _, filename := range crds {
-		manifestName := fmt.Sprintf("calico-crd-%s", filename)
-
-		output := bytes.NewBuffer([]byte{})
-
-		contents, err := static.Asset(fmt.Sprintf("manifests/calico/CustomResourceDefinition/%s", filename))
-
-		if err != nil {
-			return fmt.Errorf("failed to fetch crd %s: %w", filename, err)
-		}
-
-		tw := util.TemplateWriter{
-			Name:     fmt.Sprintf("calico-crd-%s", strings.TrimSuffix(filename, filepath.Ext(filename))),
-			Template: string(contents),
-			Data:     emptyStruct,
-		}
-		if err := tw.WriteToBuffer(output); err != nil {
-			return fmt.Errorf("failed to write calico crd manifests %s: %v", manifestName, err)
-		}
-
-		if err := c.crdSaver.Save(manifestName, output.Bytes()); err != nil {
-			return fmt.Errorf("failed to save calico crd manifest %s: %v", manifestName, err)
-		}
-	}
+// Start implements [manager.Component].
+func (c *Calico) Start(context.Context) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		var previousConfig = calicoConfig{}
+		defer close(done)
+
+		config, configChanged := c.config.Peek()
+		hasWin, hasWinChanged := c.hasWindowsNodes()
+
+		var retry <-chan time.Time
+
 		for {
-			select {
-			case <-ticker.C:
-				newConfig := c.processConfigChanges(previousConfig)
-				if newConfig != nil {
-					previousConfig = *newConfig
+			switch {
+			case config == nil, hasWin == nil:
+				c.log.Debug("Waiting for configuration")
+
+			default:
+				retry = nil
+				if err := c.processConfigChanges(&calicoConfig{
+					calicoNodeConfig:    &c.nodeConfig,
+					calicoClusterConfig: config.cluster,
+					IncludeWindows:      *hasWin,
+				}, config.patches); err != nil {
+					retry = time.After(10 * time.Second)
+					c.log.WithError(err).Error("Failed to process configuration changes, retrying in 10 seconds")
+				} else {
+					c.log.Info("Processed configuration changes")
 				}
-			case <-c.tickerDone:
-				c.log.Info("calico reconciler done")
-				return
+			}
+
+		waitForUpdates:
+			for {
+				select {
+				case <-configChanged:
+					var newConfig *calicoReconcileConfig
+					newConfig, configChanged = c.config.Peek()
+					if updateIfChanged(&config, newConfig) {
+						c.log.Info("Cluster configuration changed")
+						break waitForUpdates
+					} else {
+						c.log.Debug("Cluster config unchanged")
+					}
+
+				case <-hasWinChanged:
+					var newHasWin *bool
+					newHasWin, hasWinChanged = c.hasWindowsNodes()
+					if updateIfChanged(&hasWin, newHasWin) {
+						c.log.Info("Windows nodes changed")
+						break waitForUpdates
+					} else {
+						c.log.Debug("Windows nodes unchanged")
+					}
+
+				case <-retry:
+					c.log.Debug("Attempting to process configuration again")
+					break waitForUpdates
+
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()
 
+	c.stop = func() { cancel(); <-done }
+	return nil
+
+}
+
+func (c *Calico) dumpCRDs(patches v1beta1.Patches) error {
+	var emptyStruct struct{}
+
+	if err := dir.Init(filepath.Join(c.manifestsDir, "calico_init"), constant.ManifestsDirMode); err != nil {
+		return err
+	}
+
+	// Write the CRD definitions only at "boot", they do not change during runtime
+	crds, err := fs.ReadDir(static.CalicoManifests, "CustomResourceDefinition")
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range crds {
+		filename := entry.Name()
+		manifestName := "calico-crd-" + filename
+
+		output := bytes.NewBuffer([]byte{})
+
+		contents, err := fs.ReadFile(static.CalicoManifests, path.Join("CustomResourceDefinition", filename))
+		if err != nil {
+			return fmt.Errorf("failed to fetch crd %s: %w", filename, err)
+		}
+
+		tw := templatewriter.TemplateWriter{
+			Name:     "calico-crd-" + strings.TrimSuffix(filename, filepath.Ext(filename)),
+			Template: string(contents),
+			Data:     emptyStruct,
+			Patches:  patches,
+		}
+		if err := tw.WriteToBuffer(output); err != nil {
+			return fmt.Errorf("failed to write calico crd manifests %s: %w", manifestName, err)
+		}
+
+		if err := file.AtomicWithTarget(filepath.Join(c.manifestsDir, "calico_init", manifestName)).
+			WithPermissions(constant.CertMode).
+			Write(output.Bytes()); err != nil {
+			return fmt.Errorf("failed to save calico crd manifest %s: %w", manifestName, err)
+		}
+	}
+
 	return nil
 }
 
-func (c *Calico) processConfigChanges(previousConfig calicoConfig) *calicoConfig {
-	cfg, err := c.getConfig()
+func (c *Calico) processConfigChanges(newConfig *calicoConfig, patches v1beta1.Patches) error {
+	if err := dir.Init(filepath.Join(c.manifestsDir, "calico"), constant.ManifestsDirMode); err != nil {
+		return err
+	}
+
+	manifestDirectories, err := fs.ReadDir(static.CalicoManifests, ".")
 	if err != nil {
-		c.log.Errorf("error calculating calico configs: %s. will retry", err.Error())
-		return nil
-	}
-	if cfg == previousConfig {
-		c.log.Infof("current cfg matches existing, not gonna do anything")
-		return nil
+		return fmt.Errorf("error retrieving calico manifests: %w, will retry", err)
 	}
 
-	manifestDirectories, err := static.AssetDir("manifests/calico")
-
-	if err != nil {
-		c.log.Errorf("error retrieving calico manifests: %s. will retry", err.Error())
-		return nil
-	}
-
-	for _, dir := range manifestDirectories {
+	for _, entry := range manifestDirectories {
+		dir := entry.Name()
 		// CRDs are handled separately on boot
 		if dir == "CustomResourceDefinition" {
 			continue
 		}
-		manifestPaths, err := static.AssetDir(fmt.Sprintf("manifests/calico/%s", dir))
+		manifestPaths, err := fs.ReadDir(static.CalicoManifests, dir)
 		if err != nil {
-			c.log.Errorf("error retrieving calico manifests: %s. will retry", err.Error())
-			return nil
+			return fmt.Errorf("error retrieving calico manifests: %w, will retry", err)
 		}
 
 		tryAndLog := func(name string, e error) {
 			if e != nil {
-				c.log.Errorf("failed to write manifest %s: %v, will re-try", name, e)
+				c.log.Errorf("failed to write manifest %s: %v, will retry", name, e)
 			}
 		}
 
-		for _, filename := range manifestPaths {
+		for _, entry := range manifestPaths {
+			filename := entry.Name()
 			manifestName := fmt.Sprintf("calico-%s-%s", dir, filename)
 			output := bytes.NewBuffer([]byte{})
-			contents, err := static.Asset(fmt.Sprintf("manifests/calico/%s/%s", dir, filename))
-
+			contents, err := fs.ReadFile(static.CalicoManifests, path.Join(dir, filename))
 			if err != nil {
-				return nil
+				return fmt.Errorf("can't find manifest %s: %w", manifestName, err)
 			}
 
-			tw := util.TemplateWriter{
+			tw := templatewriter.TemplateWriter{
 				Name:     fmt.Sprintf("calico-%s-%s", dir, strings.TrimSuffix(filename, filepath.Ext(filename))),
 				Template: string(contents),
-				Data:     cfg,
+				Data:     newConfig,
+				Patches:  patches,
 			}
 			tryAndLog(manifestName, tw.WriteToBuffer(output))
-			tryAndLog(manifestName, c.saver.Save(manifestName, output.Bytes()))
+			tryAndLog(manifestName, file.AtomicWithTarget(filepath.Join(c.manifestsDir, "calico", manifestName)).
+				WithPermissions(constant.CertMode).
+				Write(output.Bytes()))
 		}
 	}
 
-	return &cfg
+	return nil
 }
 
-func (c *Calico) getConfig() (calicoConfig, error) {
-	ipv6AutoDetectionMethod := c.clusterConf.Spec.Network.Calico.IPAutodetectionMethod
-	if c.clusterConf.Spec.Network.Calico.IPv6AutodetectionMethod != "" {
-		ipv6AutoDetectionMethod = c.clusterConf.Spec.Network.Calico.IPv6AutodetectionMethod
+func (c *Calico) getConfig(clusterConfig *v1beta1.ClusterConfig) (*calicoClusterConfig, error) {
+	ipv6AutoDetectionMethod := clusterConfig.Spec.Network.Calico.IPAutodetectionMethod
+	if clusterConfig.Spec.Network.Calico.IPv6AutodetectionMethod != "" {
+		ipv6AutoDetectionMethod = clusterConfig.Spec.Network.Calico.IPv6AutodetectionMethod
 	}
-	config := calicoConfig{
-		MTU:                        c.clusterConf.Spec.Network.Calico.MTU,
-		Mode:                       c.clusterConf.Spec.Network.Calico.Mode,
-		VxlanPort:                  c.clusterConf.Spec.Network.Calico.VxlanPort,
-		VxlanVNI:                   c.clusterConf.Spec.Network.Calico.VxlanVNI,
-		EnableWireguard:            c.clusterConf.Spec.Network.Calico.EnableWireguard,
-		FlexVolumeDriverPath:       c.clusterConf.Spec.Network.Calico.FlexVolumeDriverPath,
-		DualStack:                  c.clusterConf.Spec.Network.DualStack.Enabled,
-		ClusterCIDRIPv4:            c.clusterConf.Spec.Network.PodCIDR,
-		ClusterCIDRIPv6:            c.clusterConf.Spec.Network.DualStack.IPv6PodCIDR,
-		CalicoCNIImage:             c.clusterConf.Spec.Images.Calico.CNI.URI(),
-		CalicoNodeImage:            c.clusterConf.Spec.Images.Calico.Node.URI(),
-		CalicoKubeControllersImage: c.clusterConf.Spec.Images.Calico.KubeControllers.URI(),
-		WithWindowsNodes:           c.clusterConf.Spec.Network.Calico.WithWindowsNodes,
-		Overlay:                    c.clusterConf.Spec.Network.Calico.Overlay,
-		IPAutodetectionMethod:      c.clusterConf.Spec.Network.Calico.IPAutodetectionMethod,
+
+	primaryAFIPv4 := c.primaryAddressFamily == v1beta1.PrimaryFamilyIPv4
+	isDualStack := clusterConfig.Spec.Network.DualStack.Enabled
+	config := calicoClusterConfig{
+		MTU:                        clusterConfig.Spec.Network.Calico.MTU,
+		VxlanPort:                  clusterConfig.Spec.Network.Calico.VxlanPort,
+		VxlanVNI:                   clusterConfig.Spec.Network.Calico.VxlanVNI,
+		EnableWireguard:            clusterConfig.Spec.Network.Calico.EnableWireguard,
+		EnvVars:                    clusterConfig.Spec.Network.Calico.EnvVars,
+		FlexVolumeDriverPath:       clusterConfig.Spec.Network.Calico.FlexVolumeDriverPath,
+		EnableIPv4:                 isDualStack || primaryAFIPv4,
+		EnableIPv6:                 isDualStack || !primaryAFIPv4,
+		CalicoCNIImage:             clusterConfig.Spec.Images.Calico.CNI.URI(),
+		CalicoCNIWindowsImage:      clusterConfig.Spec.Images.Calico.Windows.CNI.URI(),
+		CalicoNodeImage:            clusterConfig.Spec.Images.Calico.Node.URI(),
+		CalicoNodeWindowsImage:     clusterConfig.Spec.Images.Calico.Windows.Node.URI(),
+		CalicoKubeControllersImage: clusterConfig.Spec.Images.Calico.KubeControllers.URI(),
+		Overlay:                    clusterConfig.Spec.Network.Calico.Overlay,
+		IPAutodetectionMethod:      clusterConfig.Spec.Network.Calico.IPAutodetectionMethod,
 		IPV6AutodetectionMethod:    ipv6AutoDetectionMethod,
-		PullPolicy:                 c.clusterConf.Spec.Images.DefaultPullPolicy,
+		PullPolicy:                 clusterConfig.Spec.Images.DefaultPullPolicy,
 	}
 
-	return config, nil
+	switch clusterConfig.Spec.Network.Calico.Mode {
+	case v1beta1.CalicoModeBIRD, v1beta1.CalicoModeIPIP:
+		config.Mode = calicoModeBIRD
+	case v1beta1.CalicoModeVXLAN:
+		config.Mode = calicoModeVXLAN
+	default:
+		return nil, fmt.Errorf("unsupported mode: %q", clusterConfig.Spec.Network.Calico.Mode)
+	}
+
+	return &config, nil
 }
 
-// Stop stops the calico reconciler
+// Stop implements [manager.Component].
 func (c *Calico) Stop() error {
-	if c.tickerDone != nil {
-		close(c.tickerDone)
+	if stop := c.stop; stop != nil {
+		stop()
 	}
 	return nil
 }
 
-// Health-check interface
-func (c *Calico) Healthy() error { return nil }
+// Reconcile detects changes in configuration and applies them to the component
+func (c *Calico) Reconcile(_ context.Context, cfg *v1beta1.ClusterConfig) error {
+	c.log.Debug("reconcile method called for: Calico")
+	if cfg.Spec.Network.Provider != "calico" {
+		return nil
+	}
+
+	existingCNI := existingCNIProvider(c.manifestsDir)
+	if existingCNI != "" && existingCNI != constant.CNIProviderCalico {
+		return fmt.Errorf("cannot change CNI provider from %s to %s", existingCNI, constant.CNIProviderCalico)
+	}
+
+	calicoCRDOnce.Do(func() {
+		if err := c.dumpCRDs(cfg.Spec.Network.Calico.Patches); err != nil {
+			c.log.Errorf("error dumping Calico CRDs: %v", err)
+		}
+	})
+	newConfig, err := c.getConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("while generating Calico configuration: %w", err)
+	}
+	c.config.Set(&calicoReconcileConfig{
+		cluster: newConfig,
+		patches: cfg.Spec.Network.Calico.Patches,
+	})
+	return nil
+}

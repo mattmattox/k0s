@@ -1,188 +1,215 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2020 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package applier
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"path"
+	"path/filepath"
+	"slices"
+	"time"
 
-	"github.com/sirupsen/logrus"
-	"gopkg.in/fsnotify.v1"
-
-	"github.com/k0sproject/k0s/internal/util"
-	"github.com/k0sproject/k0s/pkg/component/controller"
+	"github.com/k0sproject/k0s/internal/pkg/dir"
+	"github.com/k0sproject/k0s/internal/pkg/file"
+	"github.com/k0sproject/k0s/pkg/component/controller/leaderelector"
+	"github.com/k0sproject/k0s/pkg/component/manager"
+	"github.com/k0sproject/k0s/pkg/config"
 	"github.com/k0sproject/k0s/pkg/constant"
 	kubeutil "github.com/k0sproject/k0s/pkg/kubernetes"
+	"github.com/k0sproject/k0s/pkg/leaderelection"
+
+	"k8s.io/apimachinery/pkg/util/wait"
+
+	"github.com/fsnotify/fsnotify"
+	"github.com/sirupsen/logrus"
 )
 
 // Manager is the Component interface wrapper for Applier
 type Manager struct {
-	K0sVars           constant.CfgVars
-	KubeClientFactory kubeutil.ClientFactory
+	K0sVars           *config.CfgVars
+	IgnoredStacks     []string
+	KubeClientFactory kubeutil.ClientFactoryInterface
 
-	//client               kubernetes.Interface
-	applier       Applier
-	bundlePath    string
-	cancelWatcher context.CancelFunc
-	log           *logrus.Entry
-	stacks        map[string]*StackApplier
+	bundleDir string
+	stop      func()
+	log       *logrus.Entry
 
-	LeaderElector controller.LeaderElector
+	LeaderElector leaderelector.Interface
+}
+
+var _ manager.Component = (*Manager)(nil)
+
+type stack = struct {
+	cancel  context.CancelCauseFunc
+	stopped <-chan struct{}
+	*StackApplier
 }
 
 // Init initializes the Manager
-func (m *Manager) Init() error {
-	err := util.InitDirectory(m.K0sVars.ManifestsDir, constant.ManifestsDirMode)
+func (m *Manager) Init(ctx context.Context) error {
+	err := dir.Init(m.K0sVars.ManifestsDir, constant.ManifestsDirMode)
 	if err != nil {
 		return fmt.Errorf("failed to create manifest bundle dir %s: %w", m.K0sVars.ManifestsDir, err)
 	}
-	m.log = logrus.WithField("component", "applier-manager")
-	m.stacks = make(map[string]*StackApplier)
-	m.bundlePath = m.K0sVars.ManifestsDir
+	m.log = logrus.WithField("component", constant.ApplierManagerComponentName)
+	m.bundleDir = m.K0sVars.ManifestsDir
 
-	m.applier = NewApplier(m.K0sVars.ManifestsDir, m.KubeClientFactory)
-
-	m.LeaderElector.AddAcquiredLeaseCallback(func() {
-		ctx, cancel := context.WithCancel(context.Background())
-		m.cancelWatcher = cancel
-		go func() {
-			_ = m.runWatchers(ctx)
-		}()
-	})
-	m.LeaderElector.AddLostLeaseCallback(func() {
-		if m.cancelWatcher != nil {
-			m.cancelWatcher()
-		}
-	})
-
-	return err
+	return nil
 }
 
 // Run runs the Manager
-func (m *Manager) Run() error {
+func (m *Manager) Start(context.Context) error {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	stopped := make(chan struct{})
+
+	m.stop = func() {
+		cancel(errors.New("applier manager is stopping"))
+		<-stopped
+	}
+
+	go func() {
+		defer close(stopped)
+		leaderelection.RunLeaderTasks(ctx, m.LeaderElector.CurrentStatus, func(ctx context.Context) {
+			wait.UntilWithContext(ctx, m.runWatchers, time.Minute)
+		})
+	}()
+
 	return nil
 }
 
 // Stop stops the Manager
 func (m *Manager) Stop() error {
-	if m.cancelWatcher != nil {
-		m.cancelWatcher()
+	if m.stop != nil {
+		m.stop()
 	}
 	return nil
 }
 
-func (m *Manager) runWatchers(ctx context.Context) error {
-	log := logrus.WithField("component", "applier-manager")
-
-	dirs, err := util.GetAllDirs(m.bundlePath)
-	if err != nil {
-		return err
-	}
-
-	for _, dir := range dirs {
-		if err := m.createStack(path.Join(m.bundlePath, dir)); err != nil {
-			log.WithError(err).Error("failed to create stack")
-			return err
-		}
-	}
-
+func (m *Manager) runWatchers(ctx context.Context) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.WithError(err).Error("failed to create watcher")
-		return err
+		m.log.WithError(err).Error("Failed to create watcher")
+		return
 	}
-	defer watcher.Close()
+	defer func() {
+		if err := watcher.Close(); err != nil {
+			m.log.WithError(err).Error("Failed to close watcher")
+		}
+	}()
 
-	err = watcher.Add(m.bundlePath)
+	err = watcher.Add(m.bundleDir)
 	if err != nil {
-		log.Warnf("Failed to start watcher: %s", err.Error())
+		m.log.WithError(err).Error("Failed to watch bundle directory")
+		return
 	}
+
+	m.log.Info("Starting watch loop")
+
+	// Add all directories after the bundle dir has been added to the watcher.
+	// Doing it the other way round introduces a race condition when directories
+	// get created after the initial listing but before the watch starts.
+
+	dirs, err := dir.GetAll(m.bundleDir)
+	if err != nil {
+		m.log.WithError(err).Error("Failed to read bundle directory")
+		return
+	}
+
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil) // satisfy linter, not required for correctness
+	stacks := make(map[string]stack, len(dirs))
+	clients := NewClients(m.KubeClientFactory)
+
+	for _, dir := range dirs {
+		m.createStack(ctx, stacks, clients, filepath.Join(m.bundleDir, dir))
+	}
+
 	for {
 		select {
-		case err, ok := <-watcher.Errors:
-			if !ok {
-				return err
-			}
+		case err := <-watcher.Errors:
+			m.log.WithError(err).Error("Watch error")
+			cancel(err)
 
-			log.Warnf("watch error: %s", err.Error())
-		case event, ok := <-watcher.Events:
-			if !ok {
-				return nil
-			}
+		case event := <-watcher.Events:
 			switch event.Op {
 			case fsnotify.Create:
-				if util.IsDirectory(event.Name) {
-					if err := m.createStack(event.Name); err != nil {
-						return err
-					}
+				if dir.IsDirectory(event.Name) {
+					m.createStack(ctx, stacks, clients, event.Name)
 				}
 			case fsnotify.Remove:
-				_ = m.removeStack(event.Name)
+				m.removeStack(ctx, stacks, event.Name)
 			}
+
 		case <-ctx.Done():
-			log.Info("manifest watcher done")
-			return nil
+			m.log.Infof("Watch loop done (%v)", context.Cause(ctx))
+			for _, stack := range stacks {
+				<-stack.stopped
+			}
+
+			return
 		}
 	}
 }
 
-func (m *Manager) createStack(name string) error {
-	// safeguard in case the fswatcher would trigger an event for an already existing watcher
-	if _, ok := m.stacks[name]; ok {
-		return nil
+func (m *Manager) createStack(ctx context.Context, stacks map[string]stack, clients Clients, name string) {
+	// safeguard in case the fswatcher would trigger an event for an already existing stack
+	if _, ok := stacks[name]; ok {
+		return
 	}
-	m.log.WithField("stack", name).Info("registering new stack")
-	sa, err := NewStackApplier(name, m.KubeClientFactory)
-	if err != nil {
-		return err
+
+	log := m.log.WithField("stack", name)
+
+	stackName := filepath.Base(name)
+	if slices.Contains(m.IgnoredStacks, stackName) {
+		if err := file.AtomicWithTarget(filepath.Join(name, "ignored.txt")).WriteString(
+			"The " + stackName + " stack is handled internally.\n" +
+				"This directory is ignored and can be safely removed.\n",
+		); err != nil {
+			log.WithError(err).Warn("Failed to write ignore notice")
+		}
+		return
 	}
+
+	ctx, cancel := context.WithCancelCause(ctx)
+	stopped := make(chan struct{})
+
+	stack := stack{cancel, stopped, NewStackApplier(name, clients)}
+	stacks[name] = stack
 
 	go func() {
-		_ = sa.Start()
-	}()
+		defer close(stopped)
 
-	m.stacks[name] = sa
-	return nil
+		wait.UntilWithContext(ctx, func(ctx context.Context) {
+			log.Info("Running stack")
+			if err := stack.Run(ctx); err != nil {
+				log.WithError(err).Error("Failed to run stack")
+			}
+		}, 1*time.Minute)
+
+		log.Infof("Stack done (%v)", context.Cause(ctx))
+	}()
 }
 
-func (m *Manager) removeStack(name string) error {
-	sa, ok := m.stacks[name]
-
+func (m *Manager) removeStack(ctx context.Context, stacks map[string]stack, name string) {
+	stack, ok := stacks[name]
 	if !ok {
 		m.log.
 			WithField("path", name).
 			Debug("attempted to remove non-existent stack, probably not a directory")
-		return nil
+		return
 	}
-	err := sa.Stop()
-	if err != nil {
-		m.log.WithField("stack", name).WithError(err).Warn("failed to stop stack applier")
-		return err
-	}
-	err = sa.DeleteStack()
-	if err != nil {
-		m.log.WithField("stack", name).WithError(err).Warn("failed to stop and delete a stack applier")
-		return err
-	}
-	m.log.WithField("stack", name).Info("stack deleted succesfully")
-	delete(m.stacks, name)
 
-	return nil
+	delete(stacks, name)
+	stack.cancel(errors.New("stack removed"))
+	<-stack.stopped
+
+	log := m.log.WithField("stack", name)
+	if err := stack.DeleteStack(ctx); err != nil {
+		log.WithError(err).Error("Failed to delete stack")
+		return
+	}
+
+	log.Info("Stack deleted successfully")
 }
-
-// Health-check interface
-func (m *Manager) Healthy() error { return nil }

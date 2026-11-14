@@ -1,137 +1,166 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2020 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package controller
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/k0sproject/k0s/internal/util"
-	config "github.com/k0sproject/k0s/pkg/apis/v1beta1"
-	"github.com/k0sproject/k0s/pkg/assets"
+	"github.com/k0sproject/k0s/internal/assets"
+	"github.com/k0sproject/k0s/internal/pkg/flags"
+	"github.com/k0sproject/k0s/internal/pkg/stringmap"
+	"github.com/k0sproject/k0s/internal/pkg/users"
+	"github.com/k0sproject/k0s/pkg/apis/k0s/v1beta1"
+	"github.com/k0sproject/k0s/pkg/component/featuregates"
+	"github.com/k0sproject/k0s/pkg/component/manager"
+	"github.com/k0sproject/k0s/pkg/config"
 	"github.com/k0sproject/k0s/pkg/constant"
 	"github.com/k0sproject/k0s/pkg/supervisor"
 )
 
 // Manager implement the component interface to run kube scheduler
 type Manager struct {
-	ClusterConfig *config.ClusterConfig
-	gid           int
-	K0sVars       constant.CfgVars
-	LogLevel      string
-	supervisor    supervisor.Supervisor
-	uid           int
+	K0sVars               *config.CfgVars
+	LogLevel              string
+	DisableLeaderElection bool
+	ServiceClusterIPRange string
+	ClusterCIDR           string
+	SingleStackIPv6       bool
+	ExtraArgs             string
+
+	supervisor     *supervisor.Supervisor
+	executablePath string
+	uid            int
+	previousConfig stringmap.StringMap
 }
 
-var cmDefaultArgs = map[string]string{
+var cmDefaultArgs = stringmap.StringMap{
 	"allocate-node-cidrs":             "true",
 	"bind-address":                    "127.0.0.1",
 	"cluster-name":                    "k0s",
 	"controllers":                     "*,bootstrapsigner,tokencleaner",
-	"enable-hostpath-provisioner":     "true",
 	"leader-elect":                    "true",
 	"use-service-account-credentials": "true",
 }
 
+const kubeControllerManagerComponent = "kube-controller-manager"
+
+var _ manager.Component = (*Manager)(nil)
+var _ manager.Reconciler = (*Manager)(nil)
+
 // Init extracts the needed binaries
-func (a *Manager) Init() error {
+func (a *Manager) Init(_ context.Context) error {
 	var err error
 	// controller manager running as api-server user as they both need access to same sa.key
-	a.uid, err = util.GetUID(constant.ApiserverUser)
+	a.uid, err = users.LookupUID(constant.ApiserverUser)
 	if err != nil {
-		logrus.Warning(fmt.Errorf("running kube-controller-manager as root: %w", err))
+		err = fmt.Errorf("failed to lookup UID for %q: %w", constant.ApiserverUser, err)
+		a.uid = users.RootUID
+		logrus.WithError(err).Warn("Running Kubernetes controller manager as root")
 	}
 
 	// controller manager should be the only component that needs access to
 	// ca.key so let it own it.
-	if err := os.Chown(path.Join(a.K0sVars.CertRootDir, "ca.key"), a.uid, -1); err != nil && os.Geteuid() == 0 {
-		logrus.Warning(fmt.Errorf("failed to change permissions for the ca.key: %w", err))
+	if err := os.Chown(filepath.Join(a.K0sVars.CertRootDir, "ca.key"), a.uid, -1); err != nil && os.Geteuid() == 0 {
+		logrus.Warn("failed to change permissions for the ca.key: ", err)
 	}
-	return assets.Stage(a.K0sVars.BinDir, "kube-controller-manager", constant.BinDirMode)
+	a.executablePath, err = assets.StageExecutable(a.K0sVars.BinDir, kubeControllerManagerComponent)
+	return err
 }
 
 // Run runs kube Manager
-func (a *Manager) Run() error {
-	logrus.Info("Starting kube-controller-manager")
+func (a *Manager) Start(_ context.Context) error { return nil }
+
+// Reconcile detects changes in configuration and applies them to the component
+func (a *Manager) Reconcile(ctx context.Context, clusterConfig *v1beta1.ClusterConfig) error {
+	logger := logrus.WithField("component", kubeControllerManagerComponent)
+	logger.Info("Starting reconcile")
 	ccmAuthConf := filepath.Join(a.K0sVars.CertRootDir, "ccm.conf")
-	args := map[string]string{
+	args := stringmap.StringMap{
 		"authentication-kubeconfig":        ccmAuthConf,
 		"authorization-kubeconfig":         ccmAuthConf,
 		"kubeconfig":                       ccmAuthConf,
-		"client-ca-file":                   path.Join(a.K0sVars.CertRootDir, "ca.crt"),
-		"cluster-signing-cert-file":        path.Join(a.K0sVars.CertRootDir, "ca.crt"),
-		"cluster-signing-key-file":         path.Join(a.K0sVars.CertRootDir, "ca.key"),
-		"requestheader-client-ca-file":     path.Join(a.K0sVars.CertRootDir, "front-proxy-ca.crt"),
-		"root-ca-file":                     path.Join(a.K0sVars.CertRootDir, "ca.crt"),
-		"service-account-private-key-file": path.Join(a.K0sVars.CertRootDir, "sa.key"),
-		"cluster-cidr":                     a.ClusterConfig.Spec.Network.BuildPodCIDR(),
-		"service-cluster-ip-range":         a.ClusterConfig.Spec.Network.BuildServiceCIDR(a.ClusterConfig.Spec.API.Address),
+		"client-ca-file":                   filepath.Join(a.K0sVars.CertRootDir, "ca.crt"),
+		"cluster-signing-cert-file":        filepath.Join(a.K0sVars.CertRootDir, "ca.crt"),
+		"cluster-signing-key-file":         filepath.Join(a.K0sVars.CertRootDir, "ca.key"),
+		"requestheader-client-ca-file":     filepath.Join(a.K0sVars.CertRootDir, "front-proxy-ca.crt"),
+		"root-ca-file":                     filepath.Join(a.K0sVars.CertRootDir, "ca.crt"),
+		"service-account-private-key-file": filepath.Join(a.K0sVars.CertRootDir, "sa.key"),
+		"cluster-cidr":                     a.ClusterCIDR,
+		"service-cluster-ip-range":         a.ServiceClusterIPRange,
 		"profiling":                        "false",
 		"terminated-pod-gc-threshold":      "12500",
 		"v":                                a.LogLevel,
 	}
 
-	for name, value := range a.ClusterConfig.Spec.ControllerManager.ExtraArgs {
-		if args[name] != "" && name != "profiling" {
-			return fmt.Errorf("cannot override kube-controller-manager flag: %s", name)
-		}
-		args[name] = value
+	// Handle the extra args as last so they can be used to override some k0s "hardcodings"
+	if a.ExtraArgs != "" {
+		// This service uses args without hyphens, so enforce that.
+		extras := flags.Split(strings.ReplaceAll(a.ExtraArgs, "--", ""))
+		args.Merge(extras)
 	}
-	if a.ClusterConfig.Spec.Network.DualStack.Enabled {
-		args["node-cidr-mask-size-ipv6"] = "110"
+
+	if clusterConfig.Spec.Network.DualStack.Enabled {
+		args["node-cidr-mask-size-ipv6"] = "117"
 		args["node-cidr-mask-size-ipv4"] = "24"
+	} else if a.SingleStackIPv6 {
+		args["node-cidr-mask-size"] = "117"
 	} else {
 		args["node-cidr-mask-size"] = "24"
 	}
-	a.ClusterConfig.Spec.Network.DualStack.EnableDualStackFeatureGate(args)
+	for name, value := range clusterConfig.Spec.ControllerManager.ExtraArgs {
+		if _, ok := args[name]; ok {
+			logger.Warnf("overriding kube-controller-manager flag with user provided value: %s", name)
+		}
+		args[name] = value
+	}
 	for name, value := range cmDefaultArgs {
 		if args[name] == "" {
 			args[name] = value
 		}
 	}
-	var cmArgs []string
-	for name, value := range args {
-		cmArgs = append(cmArgs, fmt.Sprintf("--%s=%s", name, value))
+	if a.DisableLeaderElection {
+		args["leader-elect"] = "false"
 	}
 
-	if a.ClusterConfig.Spec.API.ExternalAddress == "" {
-		cmArgs = append(cmArgs, "--leader-elect=false")
+	args = featuregates.ToArgs(args, clusterConfig.Spec.FeatureGates, kubeControllerManagerComponent)
+
+	if args.Equals(a.previousConfig) && a.supervisor != nil {
+		// no changes and supervisor already running, do nothing
+		logger.Info("reconcile has nothing to do")
+		return nil
+	}
+	// Stop in case there's process running already and we need to change the config
+	if a.supervisor != nil {
+		logger.Info("reconcile has nothing to do")
+		if err := a.supervisor.Stop(); err != nil {
+			logger.WithError(err).Error("Failed to stop executable")
+		}
+		a.supervisor = nil
 	}
 
-	a.supervisor = supervisor.Supervisor{
-		Name:    "kube-controller-manager",
-		BinPath: assets.BinPath("kube-controller-manager", a.K0sVars.BinDir),
+	a.supervisor = &supervisor.Supervisor{
+		Name:    kubeControllerManagerComponent,
+		BinPath: a.executablePath,
 		RunDir:  a.K0sVars.RunDir,
 		DataDir: a.K0sVars.DataDir,
-		Args:    cmArgs,
+		Args:    append(args.ToDashedArgs(), clusterConfig.Spec.ControllerManager.RawArgs...),
 		UID:     a.uid,
-		GID:     a.gid,
 	}
-
-	return a.supervisor.Supervise()
+	a.previousConfig = args
+	return a.supervisor.Supervise(ctx)
 }
 
 // Stop stops Manager
 func (a *Manager) Stop() error {
-	return a.supervisor.Stop()
+	if a.supervisor != nil {
+		return a.supervisor.Stop()
+	}
+	return nil
 }
-
-// Health-check interface
-func (a *Manager) Healthy() error { return nil }

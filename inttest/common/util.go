@@ -1,96 +1,399 @@
+// SPDX-FileCopyrightText: 2020 k0s authors
+// SPDX-License-Identifier: Apache-2.0
+
 package common
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"io"
+	"syscall"
+	"testing"
 	"time"
 
+	"github.com/k0sproject/k0s/internal/k0scontext"
+	"github.com/k0sproject/k0s/pkg/kubernetes/watch"
+
+	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
+	"k8s.io/client-go/restmapper"
+	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
+	aggregatorclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
+
+	"github.com/sirupsen/logrus"
+	"sigs.k8s.io/yaml"
 )
 
-// WaitForCalicoReady waits to see all calico pods healthy
-func WaitForCalicoReady(kc *kubernetes.Clientset) error {
-	return WaitForDaemonSet(kc, "calico-node")
-}
+// LogfFn will be used whenever something needs to be logged.
+type LogfFn func(format string, args ...any)
 
-// WaitForKubeRouterReady waits to see all kube-router pods healthy
-func WaitForKubeRouterReady(kc *kubernetes.Clientset) error {
-	return WaitForDaemonSet(kc, "kube-router")
-}
-
-func WaitForMetricsReady(c *rest.Config) error {
-	apiServiceClientset, err := clientset.NewForConfig(c)
-	if err != nil {
-		return err
+// Creates the resource described by the given manifest.
+func Create(ctx context.Context, restConfig *rest.Config, manifest []byte) (*unstructured.Unstructured, error) {
+	var u unstructured.Unstructured
+	if err := yaml.Unmarshal(manifest, &u); err != nil {
+		return nil, err
 	}
 
-	return wait.PollImmediate(100*time.Millisecond, 5*time.Minute, func() (done bool, err error) {
-		apiService, err := apiServiceClientset.ApiregistrationV1().APIServices().Get(context.TODO(), "v1beta1.metrics.k8s.io", v1.GetOptions{})
-		if err != nil {
-			return false, nil
-		}
+	disco, err := discovery.NewDiscoveryClientForConfig(restConfig)
+	if err != nil {
+		return nil, err
+	}
 
-		for _, c := range apiService.Status.Conditions {
-			if c.Type == "Available" && c.Status == "True" {
-				return true, nil
-			}
-		}
+	resources, err := restmapper.GetAPIGroupResources(disco)
+	if err != nil {
+		return nil, err
+	}
 
-		return false, nil
-	})
+	gvk := u.GroupVersionKind()
+	mapper := restmapper.NewDiscoveryRESTMapper(resources)
+	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	if err != nil {
+		return nil, err
+	}
+
+	dyn, err := dynamic.NewForConfig(restConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	return dyn.Resource(mapping.Resource).Namespace(u.GetNamespace()).Create(ctx, &u, metav1.CreateOptions{})
 }
 
-// WaitForDaemonSet waits for daemon set be ready
-func WaitForDaemonSet(kc *kubernetes.Clientset, name string) error {
-	return wait.PollImmediate(100*time.Millisecond, 5*time.Minute, func() (done bool, err error) {
-		ds, err := kc.AppsV1().DaemonSets("kube-system").Get(context.TODO(), name, v1.GetOptions{})
-		if err != nil {
-			return false, nil
-		}
-
-		return ds.Status.NumberAvailable == ds.Status.DesiredNumberScheduled, nil
-	})
+// context is canceled or expired.
+func Poll(ctx context.Context, condition wait.ConditionWithContextFunc) error {
+	return wait.PollUntilContextCancel(ctx, 100*time.Millisecond, true, condition)
 }
 
-// WaitForPod waits for pod be running
-func WaitForPod(kc *kubernetes.Clientset, name, namespace string) error {
-	return wait.PollImmediate(100*time.Millisecond, 5*time.Minute, func() (done bool, err error) {
-		ds, err := kc.CoreV1().Pods(namespace).Get(context.TODO(), name, v1.GetOptions{})
-		if err != nil {
-			return false, nil
-		}
-
-		return ds.Status.Phase == "Running", nil
-	})
+// WaitForKubeRouterReady waits to see all kube-router pods healthy as long as
+// the context isn't canceled.
+func WaitForKubeRouterReady(ctx context.Context, kc kubernetes.Interface) error {
+	return WaitForDaemonSet(ctx, kc, "kube-router", metav1.NamespaceSystem)
 }
 
-// WaitForPodLogs picks the first Ready pod from the list of pods in given namespace and gets the logs of it
-func WaitForPodLogs(kc *kubernetes.Clientset, namespace string) error {
-	return wait.PollImmediate(100*time.Millisecond, 5*time.Minute, func() (done bool, err error) {
-		pods, err := kc.CoreV1().Pods(namespace).List(context.TODO(), v1.ListOptions{
-			Limit: 100,
+// WaitForCoreDNSReady waits to see all coredns pods healthy as long as the context isn't canceled.
+// It also waits to see all the related svc endpoints to be ready to make sure coreDNS is actually
+// ready to serve requests.
+func WaitForCoreDNSReady(ctx context.Context, kc kubernetes.Interface) error {
+	err := WaitForDeployment(ctx, kc, "coredns", metav1.NamespaceSystem)
+	if err != nil {
+		return fmt.Errorf("wait for deployment: %w", err)
+	}
+	// Wait till we see the svc endpoints ready
+	return wait.PollImmediateUntilWithContext(ctx, 100*time.Millisecond, func(ctx context.Context) (bool, error) {
+		epSlices, err := kc.DiscoveryV1().EndpointSlices(metav1.NamespaceSystem).List(ctx, metav1.ListOptions{
+			LabelSelector: "k8s-app=kube-dns",
 		})
-		if err != nil {
-			return false, err // stop polling with error in case the pod listing fails
+
+		// NotFound is ok, it might not be created yet
+		if err != nil && !apierrors.IsNotFound(err) {
+			return true, fmt.Errorf("wait for coredns: list: %w", err)
+		} else if err != nil {
+			return false, nil
 		}
-		var readyPod *corev1.Pod
-		for _, p := range pods.Items {
-			if p.Status.Phase == "Running" {
-				readyPod = &p
+
+		if len(epSlices.Items) < 1 {
+			return false, nil
+		}
+
+		// Check that all addresses show ready conditions
+		for _, epSlice := range epSlices.Items {
+			for _, endpoint := range epSlice.Endpoints {
+				if !*endpoint.Conditions.Ready || !*endpoint.Conditions.Serving {
+					// endpoint not ready&serving yet
+					return false, nil
+				}
 			}
-		}
-		if readyPod == nil {
-			return false, nil // do not return the error so we keep on polling
-		}
-		_, err = kc.CoreV1().Pods(readyPod.Namespace).GetLogs(readyPod.Name, &corev1.PodLogOptions{Container: readyPod.Spec.Containers[0].Name}).Stream(context.Background())
-		if err != nil {
-			return false, nil // do not return the error so we keep on polling
 		}
 
 		return true, nil
 	})
+}
+
+func WaitForMetricsReady(ctx context.Context, c *rest.Config) error {
+	clientset, err := aggregatorclient.NewForConfig(c)
+	if err != nil {
+		return err
+	}
+
+	watchAPIServices := watch.FromClient[*apiregistrationv1.APIServiceList, apiregistrationv1.APIService]
+	return watchAPIServices(clientset.ApiregistrationV1().APIServices()).
+		WithObjectName("v1beta1.metrics.k8s.io").
+		WithErrorCallback(RetryWatchErrors(logfFrom(ctx))).
+		Until(ctx, func(service *apiregistrationv1.APIService) (bool, error) {
+			for _, c := range service.Status.Conditions {
+				if c.Type == apiregistrationv1.Available {
+					if c.Status == apiregistrationv1.ConditionTrue {
+						return true, nil
+					}
+
+					break
+				}
+			}
+
+			return false, nil
+		})
+}
+
+func WaitForNodeReadyStatus(ctx context.Context, clients kubernetes.Interface, nodeName string, status corev1.ConditionStatus) error {
+	return watch.Nodes(clients.CoreV1().Nodes()).
+		WithObjectName(nodeName).
+		WithErrorCallback(RetryWatchErrors(logfFrom(ctx))).
+		Until(ctx, func(node *corev1.Node) (done bool, err error) {
+			for _, cond := range node.Status.Conditions {
+				if cond.Type == corev1.NodeReady {
+					if cond.Status == status {
+						return true, nil
+					}
+
+					break
+				}
+			}
+
+			return false, nil
+		})
+}
+
+// WaitForDaemonSet waits for the DaemonlSet with the given name to have
+// as many ready replicas as defined in the spec.
+func WaitForDaemonSet(ctx context.Context, kc kubernetes.Interface, name string, namespace string) error {
+	return watch.DaemonSets(kc.AppsV1().DaemonSets(namespace)).
+		WithObjectName(name).
+		WithErrorCallback(RetryWatchErrors(logfFrom(ctx))).
+		Until(ctx, func(ds *appsv1.DaemonSet) (bool, error) {
+			return ds.Status.NumberAvailable == ds.Status.DesiredNumberScheduled, nil
+		})
+}
+
+// WaitForDeployment waits for the Deployment with the given name to become
+// available as long as the given context isn't canceled.
+func WaitForDeployment(ctx context.Context, kc kubernetes.Interface, name, namespace string) error {
+	return watch.Deployments(kc.AppsV1().Deployments(namespace)).
+		WithObjectName(name).
+		WithErrorCallback(RetryWatchErrors(logfFrom(ctx))).
+		Until(ctx, func(deployment *appsv1.Deployment) (bool, error) {
+			for _, c := range deployment.Status.Conditions {
+				if c.Type == appsv1.DeploymentAvailable {
+					if c.Status == corev1.ConditionTrue {
+						return true, nil
+					}
+
+					break
+				}
+			}
+
+			return false, nil
+		})
+}
+
+// WaitForStatefulSet waits for the StatefulSet with the given name to have
+// as many ready replicas as defined in the spec.
+func WaitForStatefulSet(ctx context.Context, kc kubernetes.Interface, name, namespace string) error {
+	return watch.StatefulSets(kc.AppsV1().StatefulSets(namespace)).
+		WithObjectName(name).
+		WithErrorCallback(RetryWatchErrors(logfFrom(ctx))).
+		Until(ctx, func(s *appsv1.StatefulSet) (bool, error) {
+			return s.Status.ReadyReplicas == *s.Spec.Replicas, nil
+		})
+}
+
+func WaitForDefaultStorageClass(ctx context.Context, kc kubernetes.Interface) error {
+	return Poll(ctx, waitForDefaultStorageClass(kc))
+}
+
+func waitForDefaultStorageClass(kc kubernetes.Interface) wait.ConditionWithContextFunc {
+	return func(ctx context.Context) (done bool, err error) {
+		sc, err := kc.StorageV1().StorageClasses().Get(ctx, "openebs-hostpath", metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+
+		return sc.Annotations["storageclass.kubernetes.io/is-default-class"] == "true", nil
+	}
+}
+
+// WaitForPod waits for the given pod to become ready as long as the given
+// context isn't canceled.
+func WaitForPod(ctx context.Context, kc kubernetes.Interface, name, namespace string) error {
+	return watch.Pods(kc.CoreV1().Pods(namespace)).
+		WithObjectName(name).
+		WithErrorCallback(RetryWatchErrors(logfFrom(ctx))).
+		Until(ctx, func(pod *corev1.Pod) (bool, error) {
+			for _, cond := range pod.Status.Conditions {
+				if cond.Type == corev1.PodReady {
+					if cond.Status == corev1.ConditionTrue {
+						return true, nil
+					}
+
+					break
+				}
+			}
+
+			return false, nil
+		})
+}
+
+func WaitForLease(ctx context.Context, kc kubernetes.Interface, name string, namespace string) (string, error) {
+	var holderIdentity string
+	watchLeases := watch.FromClient[*coordinationv1.LeaseList, coordinationv1.Lease]
+	if err := watchLeases(kc.CoordinationV1().Leases(namespace)).
+		WithObjectName(name).
+		WithErrorCallback(RetryWatchErrors(logfFrom(ctx))).
+		Until(
+			ctx, func(lease *coordinationv1.Lease) (bool, error) {
+				holderIdentity = *lease.Spec.HolderIdentity
+				// Verify that there's a valid holder on the lease
+				return holderIdentity != "", nil
+			},
+		); err != nil {
+		return "", err
+	}
+
+	return holderIdentity, nil
+}
+
+func RetryWatchErrors(logf LogfFn) watch.ErrorCallback {
+	return func(err error) (time.Duration, error) {
+		if retryDelay, e := watch.IsRetryable(err); e == nil {
+			logf("Encountered transient watch error, retrying in %s: %v", retryDelay, err)
+			return retryDelay, nil
+		}
+
+		retryDelay := 1 * time.Second
+
+		switch {
+		case errors.Is(err, syscall.ECONNRESET):
+			logf("Encountered connection reset while watching, retrying in %s: %v", retryDelay, err)
+			return retryDelay, nil
+
+		case errors.Is(err, syscall.ECONNREFUSED):
+			logf("Encountered connection refused while watching, retrying in %s: %v", retryDelay, err)
+			return retryDelay, nil
+
+		case errors.Is(err, io.EOF):
+			logf("Encountered EOF while watching, retrying in %s: %v", retryDelay, err)
+			return retryDelay, nil
+		}
+
+		return 0, err
+	}
+}
+
+func ResetNode(name string, suite *BootlooseSuite) error {
+	ssh, err := suite.SSH(suite.Context(), name)
+	if err != nil {
+		return err
+	}
+	defer ssh.Disconnect()
+	_, err = ssh.ExecWithOutput(suite.Context(), suite.K0sFullPath+" reset --debug")
+	return err
+}
+
+// Retrieves the LogfFn stored in context, falling back to use testing.T's Logf
+// if the context has a *testing.T or logrus's Infof as a last resort.
+func logfFrom(ctx context.Context) LogfFn {
+	if logf := k0scontext.Value[LogfFn](ctx); logf != nil {
+		return logf
+	}
+	if t := k0scontext.Value[*testing.T](ctx); t != nil {
+		return t.Logf
+	}
+	return logrus.Infof
+}
+
+type LineWriter struct {
+	WriteLine func([]byte)
+	buf       []byte
+}
+
+// Write implements [io.Writer].
+func (s *LineWriter) Write(in []byte) (int, error) {
+	s.buf = append(s.buf, in...)
+	s.logLines()
+	return len(in), nil
+}
+
+// Logs each complete line and discards the used data.
+func (s *LineWriter) logLines() {
+	var off int
+	for {
+		n := bytes.IndexByte(s.buf[off:], '\n')
+		if n < 0 {
+			break
+		}
+
+		s.WriteLine(s.buf[off : off+n])
+		off += n + 1
+	}
+
+	// Move the unprocessed data to the beginning of the buffer and reset the length.
+	if off > 0 {
+		len := copy(s.buf, s.buf[off:])
+		s.buf = s.buf[:len]
+	}
+}
+
+// Logs any remaining data in the buffer that doesn't end with a newline.
+func (s *LineWriter) Flush() {
+	if len(s.buf) > 0 {
+		s.WriteLine(s.buf)
+		// Reset the length and keep the underlying array.
+		s.buf = s.buf[:0]
+	}
+}
+
+// VerifyNoRestartedPods returns a slice of errors with the restarted pods in kube-system.
+// In order to verify this, the test makes sure that the node has been ready for at least 80 seconds,
+// which is enough to validate that the calico (slowest component to restart due to a liveness probe error)
+// would have restarted.
+func VerifyNoRestartedPods(ctx context.Context, client *kubernetes.Clientset) []error {
+	var errs []error
+
+	// Check that every node has been ready for at least 80 seconds before we check if
+	// there are restarts. Otherwise we won't be able to catch failed livenessProbes.
+	nodes, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return []error{err}
+	}
+	for _, node := range nodes.Items {
+		for _, condition := range node.Status.Conditions {
+			if condition.Type == corev1.NodeReady {
+				if condition.Status != corev1.ConditionTrue {
+					errs = append(errs, fmt.Errorf("node %q condition %s is %q", node.Name, corev1.NodeReady, condition.Status))
+					continue
+				}
+				// Wait 80 seconds after the node becomes ready so that we ensure that
+				// livenessProbes had enough time to fail and that the pods have restarted.
+				select {
+				case <-time.After(time.Until(condition.LastTransitionTime.Add(80 * time.Second))):
+				case <-ctx.Done():
+					errs = append(errs, ctx.Err())
+					return errs
+				}
+			}
+		}
+	}
+
+	pods, err := client.CoreV1().Pods(metav1.NamespaceSystem).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		errs = append(errs, err)
+	}
+	for _, pod := range pods.Items {
+		for _, cs := range pod.Status.ContainerStatuses {
+			if cs.RestartCount != int32(0) {
+				errs = append(errs, fmt.Errorf("pod %s container %s has %d restarts. Should be 0", pod.Name, cs.Name, cs.RestartCount))
+			}
+		}
+	}
+	return errs
 }

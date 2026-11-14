@@ -1,48 +1,48 @@
+//go:build linux || windows
+
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
+
 package cleanup
 
 import (
-	"fmt"
-	"strings"
+	"context"
+	"errors"
+	"io/fs"
+	"os/exec"
 
-	"github.com/k0sproject/k0s/pkg/install"
+	"github.com/k0sproject/k0s/internal/install"
+	"github.com/kardianos/service"
 	"github.com/sirupsen/logrus"
 )
 
-type services struct {
-	Config *Config
-	roles  []string
-}
+type services struct{}
 
 // Name returns the name of the step
 func (s *services) Name() string {
-	return "uninstal service step"
-}
-
-// NeedsToRun checks if k0s service files are persent on the host
-func (s *services) NeedsToRun() bool {
-	possibleRoles := []string{
-		"controller", "worker",
-	}
-	for _, prole := range possibleRoles {
-		if _, stub, err := install.GetSysInit(prole); err == nil && stub != "" {
-			s.roles = append(s.roles, prole)
-		}
-	}
-
-	return len(s.roles) > 0
+	return "uninstall service step"
 }
 
 // Run uninstalls k0s services that are found on the host
-func (s *services) Run() error {
-	var msg []string
-	for _, role := range s.roles {
+func (s *services) Run(context.Context) error {
+	var errs []error
+
+	for _, role := range []string{"controller", "worker"} {
+		logrus.Debugf("attempting to uninstall k0s%s service", role)
 		if err := install.UninstallService(role); err != nil {
-			logrus.Debugf("Tried removing service: %v", err)
-			msg = append(msg, err.Error())
+			if !errors.Is(err, service.ErrNotInstalled) && !errors.Is(err, fs.ErrNotExist) && !isExitCode(err, 1) {
+				errs = append(errs, err)
+			}
+		} else {
+			logrus.Infof("uninstalled k0s%s service", role)
+			return nil
 		}
 	}
-	if len(msg) > 0 {
-		return fmt.Errorf("%v", strings.Join(msg, "\n"))
-	}
-	return nil
+
+	return errors.Join(errs...)
+}
+
+func isExitCode(err error, exitcode int) bool {
+	e, ok := errors.AsType[*exec.ExitError](err)
+	return ok && e.ExitCode() == exitcode
 }

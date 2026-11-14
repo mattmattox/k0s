@@ -1,19 +1,24 @@
+// SPDX-FileCopyrightText: 2020 k0s authors
+// SPDX-License-Identifier: Apache-2.0
+
 package telemetry
 
 import (
-	"github.com/segmentio/analytics-go"
+	"github.com/segmentio/analytics-go/v3"
 )
 
 var segmentToken = ""
 
 const heartbeatEvent = "cluster-heartbeat"
 
-// Analytics is the interface used for our analytics client.
-type analyticsClient interface {
-	Enqueue(msg analytics.Message) error
-	Close() error
+func IsEnabled() bool {
+	return segmentToken != ""
 }
 
-func newSegmentClient(segmentToken string) analyticsClient {
+func NewDefaultSegmentClient() analytics.Client {
+	if !IsEnabled() {
+		return nil
+	}
+
 	return analytics.New(segmentToken)
 }

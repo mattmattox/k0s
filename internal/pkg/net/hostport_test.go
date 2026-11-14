@@ -1,0 +1,132 @@
+// SPDX-FileCopyrightText: 2022 k0s authors
+// SPDX-License-Identifier: Apache-2.0
+
+package net_test
+
+import (
+	"testing"
+
+	"github.com/k0sproject/k0s/internal/pkg/net"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestNewHostPort(t *testing.T) {
+	for _, test := range []struct {
+		name                         string
+		host                         string
+		port                         uint16
+		expectedHost, expectedString string
+	}{
+		{"ipv4", "127.0.0.1", 4711, "127.0.0.1", "127.0.0.1:4711"},
+		{"ipv6", "::1", 4711, "::1", "[::1]:4711"},
+		{"ipv6_zone", "fe80::1%eth0", 4711, "fe80::1%eth0", "[fe80::1%eth0]:4711"},
+		{"dns", "example.com", 4711, "example.com", "example.com:4711"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hostPort, err := net.NewHostPort(test.host, test.port)
+			if assert.NoError(t, err) && assert.NotNil(t, hostPort) {
+				assert.Equal(t, test.expectedHost, hostPort.Host())
+				assert.Equal(t, test.port, hostPort.Port())
+				assert.Equal(t, test.expectedString, hostPort.String())
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name   string
+		host   string
+		port   uint16
+		errMsg string
+	}{
+		{"spaces", "f o o", 4711, "host is neither an IP address nor a DNS name"},
+		{"zero_port", "foo", 0, "port is zero"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hostPort, err := net.NewHostPort(test.host, test.port)
+			assert.Nil(t, hostPort)
+			if assert.Error(t, err) {
+				assert.Equal(t, test.errMsg, err.Error())
+			}
+		})
+	}
+}
+
+func TestParseHostPort(t *testing.T) {
+	for _, test := range []struct {
+		name, hostPort string
+		host           string
+		port           uint16
+		str            string
+	}{
+		{"ipv4", "127.0.0.1:4711", "127.0.0.1", 4711, "127.0.0.1:4711"},
+		{"ipv6", "[::1]:4711", "::1", 4711, "[::1]:4711"},
+		{"ipv6_zone", "[fe80::1%eth0]:4711", "fe80::1%eth0", 4711, "[fe80::1%eth0]:4711"},
+		{"dns", "example.com:4711", "example.com", 4711, "example.com:4711"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hostPort, err := net.ParseHostPort(test.hostPort)
+			if assert.NoError(t, err) && assert.NotNil(t, hostPort) {
+				assert.Equal(t, test.host, hostPort.Host())
+				assert.Equal(t, test.port, hostPort.Port())
+				assert.Equal(t, test.str, hostPort.String())
+			}
+		})
+	}
+
+	for _, test := range []struct{ name, hostPort, errMsg string }{
+		{"spaces", "f o o:4711", "host is neither an IP address nor a DNS name"},
+		{"missing_port", "foo", "missing port in address"},
+		{"missing_ipv4_port", "127.0.0.1", "missing port in address"},
+		{"missing_ipv6_port_unspecified", "::", "missing port in address"},
+		{"missing_ipv6_port_localhost", "::1", "missing port in address"},
+		{"missing_ipv6_port_full", "0:0:0:0:0:0:0:1", "missing port in address"},
+		{"missing_ipv6_port_host", "[::1]", "missing port in address"},
+		{"ipv4_address_as_ipv6_host", "[127.0.0.1]", "host is neither an IP address nor a DNS name"},
+		{"empty_port", "foo:", `port is not a positive number: ""`},
+		{"zero_port", "foo:0", "port is zero"},
+		{"negative_port", "foo:-1", `port is not a positive number: "-1"`},
+		{"big_port", "foo:65536", "port is out of range: 65536"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hostPort, err := net.ParseHostPort(test.hostPort)
+			assert.Nil(t, hostPort)
+			if assert.Error(t, err) {
+				assert.Equal(t, test.errMsg, err.Error())
+			}
+		})
+	}
+}
+
+func TestParseHostPortWithDefault(t *testing.T) {
+	for _, test := range []struct{ name, host, parsedHost, defaultHostPort, hostPort string }{
+		{"ipv4", "127.0.0.1", "127.0.0.1", "127.0.0.1:4711", "127.0.0.1:1337"},
+		{"ipv6_unspecified", "::", "::", "[::]:4711", "[::]:1337"},
+		{"ipv6_localhost", "::1", "::1", "[::1]:4711", "[::1]:1337"},
+		{"ipv6_full", "0:0:0:0:0:0:0:1", "0:0:0:0:0:0:0:1", "[0:0:0:0:0:0:0:1]:4711", "[0:0:0:0:0:0:0:1]:1337"},
+		{"ipv6_zone", "fe80::1%eth0", "fe80::1%eth0", "[fe80::1%eth0]:4711", "[fe80::1%eth0]:1337"},
+		{"ipv6_host", "[::1]", "::1", "[::1]:4711", "[::1]:1337"},
+		{"host", "yep", "yep", "yep:4711", "yep:1337"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hostPort, err := net.ParseHostPortWithDefault(test.host, 0)
+			assert.Nil(t, hostPort)
+			if assert.Error(t, err) {
+				assert.Equal(t, "missing port in address", err.Error())
+			}
+
+			hostPort, err = net.ParseHostPortWithDefault(test.host, 4711)
+			if assert.NoError(t, err) && assert.NotNil(t, hostPort) {
+				assert.Equal(t, test.parsedHost, hostPort.Host())
+				assert.Equal(t, uint16(4711), hostPort.Port())
+				assert.Equal(t, test.defaultHostPort, hostPort.String())
+			}
+
+			hostPort, err = net.ParseHostPortWithDefault(test.hostPort, 4711)
+			if assert.NoError(t, err) && assert.NotNil(t, hostPort) {
+				assert.Equal(t, test.parsedHost, hostPort.Host())
+				assert.Equal(t, uint16(1337), hostPort.Port())
+				assert.Equal(t, test.hostPort, hostPort.String())
+			}
+		})
+	}
+}

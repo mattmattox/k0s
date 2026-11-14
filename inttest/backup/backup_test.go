@@ -1,99 +1,151 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package basic
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/k0sproject/k0s/inttest/common"
+	etcdv1beta1 "github.com/k0sproject/k0s/pkg/apis/etcd/v1beta1"
+	k0sv1beta1 "github.com/k0sproject/k0s/pkg/apis/k0s/v1beta1"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/stretchr/testify/suite"
+	"sigs.k8s.io/yaml"
 
-	"github.com/k0sproject/k0s/inttest/common"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"github.com/stretchr/testify/suite"
 )
 
 type BackupSuite struct {
-	common.FootlooseSuite
+	common.BootlooseSuite
+	backupFunc  func() error
+	restoreFunc func() error
+	useKine     bool
+}
+
+func (s *BackupSuite) getControllerConfig() string {
+	config := k0sv1beta1.ClusterConfig{
+		Spec: &k0sv1beta1.ClusterSpec{
+			Network: &k0sv1beta1.Network{
+				NodeLocalLoadBalancing: &k0sv1beta1.NodeLocalLoadBalancing{
+					Enabled: s.ControllerCount > 1,
+				},
+			},
+		},
+	}
+
+	if s.useKine {
+		config.Spec.Storage = &k0sv1beta1.StorageSpec{
+			Type: k0sv1beta1.KineStorageType,
+		}
+	}
+
+	yaml, err := yaml.Marshal(&config)
+	s.Require().NoError(err)
+	return string(yaml)
 }
 
 func (s *BackupSuite) TestK0sGetsUp() {
-	s.Require().NoError(s.InitController(0))
+	ctx := s.TContext()
+
+	config := s.getControllerConfig()
+	s.T().Log("Config:", config)
+	s.PutFile(s.ControllerNode(0), "/tmp/k0s.yaml", config)
+
+	s.Require().NoError(s.InitController(0, "--config=/tmp/k0s.yaml", "--enable-worker"))
 	s.Require().NoError(s.RunWorkers())
 
 	kc, err := s.KubeClient(s.ControllerNode(0))
 	s.Require().NoError(err)
-	s.Require().NoError(s.WaitJoinAPI(s.ControllerNode(0)))
-	token, err := s.GetJoinToken("controller")
-	s.Require().NoError(err)
-	s.Require().NoError(s.InitController(1, token))
-	s.Require().NoError(s.WaitJoinAPI(s.ControllerNode(1)))
 
-	err = s.WaitForNodeReady(s.WorkerNode(0), kc)
-	s.Require().NoError(err)
+	var token string
+	if s.ControllerCount > 1 {
+		s.Require().NoError(s.WaitJoinAPI(s.ControllerNode(0)))
+		token, err = s.GetJoinToken("controller")
+		s.Require().NoError(err)
 
-	err = s.WaitForNodeReady(s.WorkerNode(1), kc)
-	s.Require().NoError(err)
+		for i := range s.ControllerCount - 1 {
+			i := i + 1
+			s.PutFile(s.ControllerNode(i), "/tmp/k0s.yaml", config)
+			s.Require().NoError(s.InitController(i, token, "--config=/tmp/k0s.yaml"))
+		}
+	}
 
-	pods, err := kc.CoreV1().Pods("kube-system").List(context.TODO(), v1.ListOptions{
-		Limit: 100,
-	})
-	s.Require().NoError(err)
+	s.Require().NoError(s.WaitForNodeReady(s.ControllerNode(0), kc))
+	for i := range s.WorkerCount {
+		s.Require().NoError(s.WaitForNodeReady(s.WorkerNode(i), kc))
+	}
 
-	podCount := len(pods.Items)
-
-	s.T().Logf("found %d pods in kube-system", podCount)
-	s.Greater(podCount, 0, "expecting to see few pods in kube-system namespace")
+	s.AssertSomeKubeSystemPods(kc)
 
 	s.T().Log("waiting to see kube-router pods ready")
-	s.Require().NoError(common.WaitForKubeRouterReady(kc), "kube-router did not start")
+	s.Require().NoError(common.WaitForKubeRouterReady(s.Context(), kc), "kube-router did not start")
 
-	s.Require().NoError(s.takeBackup())
+	s.Require().NoError(s.backupFunc())
 
 	snapshot := s.makeSnapshot(kc)
 
-	s.Require().NoError(err)
+	for i := range s.ControllerCount {
+		s.Require().NoError(s.StopController(s.ControllerNode(i)))
+		s.reset(s.ControllerNode(i))
+	}
 
-	s.Require().NoError(s.StopController(s.ControllerNode(0)))
-	_ = s.StopController(s.ControllerNode(1)) // No error check as k0s might have actually exited since etcd is not really happy
+	s.Require().NoError(s.restoreFunc())
+	s.Require().NoError(s.InitController(0, "--enable-worker"))
+	s.Require().NoError(s.WaitForNodeReady(s.ControllerNode(0), kc))
 
-	s.Require().NoError(s.Reset(s.ControllerNode(0)))
-	s.Require().NoError(s.Reset(s.ControllerNode(1)))
+	// Check if the first controller detects the other controllers as stale
+	if !s.useKine {
+		awaitEtcdMemberReconciliation(ctx, s)
+	}
 
-	s.Require().NoError(s.restoreBackup())
-	s.Require().NoError(s.InitController(0))
-	s.Require().NoError(s.WaitJoinAPI(s.ControllerNode(0)))
+	// Join the other controllers in the usual way
+	if s.ControllerCount > 1 {
+		s.Require().NoError(s.WaitJoinAPI(s.ControllerNode(0)))
+		for i := range s.ControllerCount - 1 {
+			i := i + 1
+			s.PutFile(s.ControllerNode(i), "/etc/k0s/k0s.yaml", config)
+			s.Require().NoError(s.InitController(i, token))
+		}
+	}
 
-	// Join the second controller as normally
-	s.Require().NoError(s.InitController(1, token))
-
-	s.Require().NoError(err)
-
-	err = s.WaitForNodeReady(s.WorkerNode(0), kc)
-	s.Require().NoError(err)
-
-	err = s.WaitForNodeReady(s.WorkerNode(1), kc)
-	s.Require().NoError(err)
+	for i := range s.WorkerCount {
+		s.Require().NoError(s.WaitForNodeReady(s.WorkerNode(i), kc))
+	}
 
 	snapshotAfterBackup := s.makeSnapshot(kc)
-	s.Require().NoError(err)
 	// Matching object UIDs after restore guarantees we got the full state restored
 	s.Require().Equal(snapshot, snapshotAfterBackup)
+
+	s.Require().NoError(s.VerifyFileSystemRestore())
+
+	// Check that all controllers are listed as joined etcd members
+	if !s.useKine {
+		awaitEtcdMemberReconciliation(ctx, s)
+	}
+}
+
+func (s *BackupSuite) reset(name string) {
+	ssh, err := s.SSH(s.Context(), name)
+	s.Require().NoError(err)
+	defer ssh.Disconnect()
+	s.Require().NoError(ssh.Exec(s.Context(), `
+		set -eu
+		k0s reset --debug
+		rm /tmp/k0s.yaml
+	`, common.SSHStreams{}))
 }
 
 type snapshot struct {
@@ -105,24 +157,24 @@ type snapshot struct {
 func (s *BackupSuite) makeSnapshot(kc *kubernetes.Clientset) snapshot {
 	// Take some UIDs to be able to verify state has restored properly
 	namespaces := make(map[types.UID]string)
-	nsList, err := kc.CoreV1().Namespaces().List(context.TODO(), v1.ListOptions{})
+	nsList, err := kc.CoreV1().Namespaces().List(s.Context(), metav1.ListOptions{})
 	s.Require().NoError(err)
 	for _, n := range nsList.Items {
-		namespaces[n.ObjectMeta.UID] = n.Name
+		namespaces[n.UID] = n.Name
 	}
 
 	services := make(map[types.UID]string)
 	{
-		svc, err := kc.CoreV1().Services("default").Get(context.TODO(), "kubernetes", v1.GetOptions{})
+		svc, err := kc.CoreV1().Services(metav1.NamespaceDefault).Get(s.Context(), "kubernetes", metav1.GetOptions{})
 		s.Require().NoError(err)
-		services[svc.ObjectMeta.UID] = svc.Name
+		services[svc.UID] = svc.Name
 	}
 
 	nodes := make(map[types.UID]string)
-	nodeList, err := kc.CoreV1().Nodes().List(context.TODO(), v1.ListOptions{})
+	nodeList, err := kc.CoreV1().Nodes().List(s.Context(), metav1.ListOptions{})
 	s.Require().NoError(err)
 	for _, n := range nodeList.Items {
-		nodes[n.ObjectMeta.UID] = n.Name
+		nodes[n.UID] = n.Name
 	}
 
 	return snapshot{
@@ -132,45 +184,187 @@ func (s *BackupSuite) makeSnapshot(kc *kubernetes.Clientset) snapshot {
 	}
 }
 
-func (s *BackupSuite) takeBackup() error {
-	ssh, err := s.SSH(s.ControllerNode(0))
+func (s *BackupSuite) VerifyFileSystemRestore() error {
+	ssh, err := s.SSH(s.Context(), s.ControllerNode(0))
 	if err != nil {
 		return err
 	}
 	defer ssh.Disconnect()
 
-	out, err := ssh.ExecWithOutput("k0s backup --save-path /root/")
+	// Checking for containerd should be enough given https://github.com/k0sproject/k0s/issues/2420
+	// containerd may take a bit to start so we want to retry a few times
+	checkPID := func() bool {
+		_, err = ssh.ExecWithOutput(s.Context(), "/bin/pidof /var/lib/k0s/bin/containerd")
+		return err == nil
+	}
+
+	s.Eventuallyf(checkPID, 180*time.Second, 10*time.Second,
+		"fetching pidof containerd failed after 3 minutes with error: %v", err)
+	return nil
+}
+
+func (s *BackupSuite) takeBackup() error {
+	ssh, err := s.SSH(s.Context(), s.ControllerNode(0))
 	if err != nil {
-		s.T().Errorf("backup failed with output:\n%s", out)
 		return err
 	}
-	s.T().Logf("backup taken succesfully with output:\n%s", out)
+	defer ssh.Disconnect()
+
+	out, err := ssh.ExecWithOutput(s.Context(), "/usr/local/bin/k0s backup --debug --save-path /root/")
+	if !s.NoErrorf(err, "backup failed with output: %s", out) {
+		return err
+	}
+	s.T().Logf("backup taken successfully with output:\n%s", out)
+	return nil
+}
+
+func (s *BackupSuite) takeBackupStdout() error {
+	ssh, err := s.SSH(s.Context(), s.ControllerNode(0))
+	if err != nil {
+		return err
+	}
+	defer ssh.Disconnect()
+
+	out, err := ssh.ExecWithOutput(s.Context(), "/usr/local/bin/k0s backup --debug --save-path - > backup.tar.gz")
+	if !s.NoErrorf(err, "backup failed with output: %s", out) {
+		return err
+	}
+
+	out, err = ssh.ExecWithOutput(s.Context(), "tar tf backup.tar.gz")
+	if !s.NoErrorf(err, "backup inspection failed with output: %s", out) {
+		return err
+	}
+
+	s.T().Logf("backup taken successfully with output:\n%s", out)
 	return nil
 }
 
 func (s *BackupSuite) restoreBackup() error {
-	ssh, err := s.SSH(s.ControllerNode(0))
+	ssh, err := s.SSH(s.Context(), s.ControllerNode(0))
 	if err != nil {
 		return err
 	}
 	defer ssh.Disconnect()
 
-	out, err := ssh.ExecWithOutput("k0s restore $(ls /root/k0s_backup_*.tar.gz)")
-	if err != nil {
-		s.T().Errorf("restored failed with output:\n%s", out)
+	s.T().Log("restoring controller from file")
+
+	out, err := ssh.ExecWithOutput(s.Context(), "/usr/local/bin/k0s restore --debug --config-out /etc/k0s/k0s.yaml $(ls /root/k0s_backup_*.tar.gz)")
+	if !s.NoErrorf(err, "restore failed with output: %s", out) {
 		return err
 	}
-	s.T().Logf("restored succesfully with output:\n%s", out)
+	s.T().Logf("restored successfully with output:\n%s", out)
 
 	return nil
 }
 
+func (s *BackupSuite) restoreBackupStdin() error {
+	ssh, err := s.SSH(s.Context(), s.ControllerNode(0))
+	if err != nil {
+		return err
+	}
+	defer ssh.Disconnect()
+
+	s.T().Log("restoring controller from stdin")
+
+	out, err := ssh.ExecWithOutput(s.Context(), "cat backup.tar.gz | /usr/local/bin/k0s restore --debug -")
+	if !s.NoErrorf(err, "restore failed with output: %s", out) {
+		return err
+	}
+	s.T().Logf("restored successfully with output:\n%s", out)
+
+	return nil
+}
+
+func awaitEtcdMemberReconciliation(ctx context.Context, s *BackupSuite) {
+	ssh, err := s.SSH(ctx, s.ControllerNode(0))
+	s.Require().NoError(err)
+	defer ssh.Disconnect()
+
+	emc, err := s.EtcdMemberClient(s.ControllerNode(0))
+	s.Require().NoError(err)
+
+	for {
+		select {
+		case <-time.After(7 * time.Second):
+		case <-ctx.Done():
+			s.FailNow("Interrupted")
+		}
+
+		reconciled, err := emc.EtcdMembers().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			s.T().Log("Failed to list etcd members:", err)
+			continue
+		}
+
+		actual, err := listEtcdMembers(ctx, ssh)
+		if err != nil {
+			s.T().Logf("k0s etcd member-list failed: %v", err)
+			continue
+		}
+
+		var errs []string
+		for _, member := range reconciled.Items {
+			joined := slices.ContainsFunc(member.Status.Conditions, func(c etcdv1beta1.JoinCondition) bool {
+				return c.Status == etcdv1beta1.ConditionTrue && c.Type == etcdv1beta1.ConditionTypeJoined
+			})
+			if peerURL, ok := actual[member.Name]; ok {
+				delete(actual, member.Name)
+				if !joined {
+					errs = append(errs, "etcd member "+member.Name+" not marked as joined")
+				}
+				if peerURL, err := url.Parse(peerURL); err != nil {
+					errs = append(errs, "failed to parse peer URL of etcd member "+member.Name+" ("+err.Error()+")")
+				} else if peerURL.Hostname() != member.Status.PeerAddress {
+					errs = append(errs, fmt.Sprintf("etcd member %s peer address mismatch: %q != %q", member.Name, peerURL, member.Status.PeerAddress))
+				}
+			} else if joined {
+				errs = append(errs, "stale etcd member "+member.Name)
+			}
+		}
+		if len(errs) > 0 {
+			s.T().Log("Etcd members not fully reconciled:", strings.Join(errs, "; "))
+		} else {
+			s.T().Logf("Etcd members fully reconciled")
+			break
+		}
+	}
+}
+
+func listEtcdMembers(ctx context.Context, ssh *common.SSHConnection) (map[string]string, error) {
+	var out bytes.Buffer
+	if err := ssh.Exec(ctx, "k0s etcd member-list", common.SSHStreams{Out: &out}); err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Members map[string]string `json:"members"`
+	}
+	err := json.Unmarshal(out.Bytes(), &result)
+	return result.Members, err
+}
+
 func TestBackupSuite(t *testing.T) {
 	s := BackupSuite{
-		common.FootlooseSuite{
-			ControllerCount: 2,
+		BootlooseSuite: common.BootlooseSuite{
+			ControllerCount: 3,
 			WorkerCount:     2,
 		},
 	}
+	s.backupFunc = s.takeBackup
+	s.restoreFunc = s.restoreBackup
+
+	if target := os.Getenv("K0S_INTTEST_TARGET"); strings.Contains(target, "stream") {
+		t.Log("Using stdout/stderr")
+		s.ControllerCount = 1
+		s.WorkerCount = 1
+		s.backupFunc = s.takeBackupStdout
+		s.restoreFunc = s.restoreBackupStdin
+	} else if strings.Contains(target, "kine") {
+		t.Log("Using kine")
+		s.ControllerCount = 1
+		s.WorkerCount = 2
+		s.useKine = true
+	}
+
 	suite.Run(t, &s)
 }

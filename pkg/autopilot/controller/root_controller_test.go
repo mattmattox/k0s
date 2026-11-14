@@ -1,0 +1,125 @@
+//go:build unix
+
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
+
+package controller
+
+import (
+	"context"
+	"io/fs"
+	"net/netip"
+	"sync"
+	"testing"
+	"testing/synctest"
+
+	aptu "github.com/k0sproject/k0s/internal/autopilot/testutil"
+	"github.com/k0sproject/k0s/pkg/apis/k0s/v1beta1"
+	aproot "github.com/k0sproject/k0s/pkg/autopilot/controller/root"
+	apsigk0s "github.com/k0sproject/k0s/pkg/autopilot/controller/signal/k0s"
+	"github.com/k0sproject/k0s/pkg/autopilot/controller/updates"
+	"github.com/k0sproject/k0s/pkg/leaderelection"
+	"github.com/k0sproject/k0s/static"
+
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/yaml"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type fakeLeaderElector chan leaderelection.Status
+
+// Run implements leaderElector.
+func (le fakeLeaderElector) Run(ctx context.Context, callback func(leaderelection.Status)) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case status, ok := <-le:
+			if !ok {
+				return
+			}
+			callback(status)
+		}
+	}
+}
+
+// TestModeSwitch tests the scenario of losing + re-acquiring the kubernetes lease.
+// This toggle should result in sub-controllers being shutdown and then restarted.
+func TestModeSwitch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logger := logrus.New().WithField("app", "autopilot-test")
+		clientFactory := aptu.NewFakeClientFactory(func() *unstructured.Unstructured {
+			raw, err := fs.ReadFile(static.CRDs, "autopilot/autopilot.k0sproject.io_controlnodes.yaml")
+			require.NoError(t, err)
+			var crd unstructured.Unstructured
+			require.NoError(t, yaml.Unmarshal(raw, &crd.Object))
+			require.NoError(t, unstructured.SetNestedSlice(crd.Object, []any{
+				map[string]any{
+					"type":   string(apiextensionsv1.Established),
+					"status": string(apiextensionsv1.ConditionTrue),
+				},
+			}, "status", "conditions"))
+			return &crd
+		}())
+
+		rootControllerInterface, err := NewRootController(aproot.RootConfig{}, logger, false, clientFactory, updates.NewClusterInfoCollector(v1beta1.DefaultClusterConfig(), clientFactory.Client), netip.IPv4Unspecified())
+		assert.NoError(t, err)
+
+		rootController, ok := rootControllerInterface.(*rootController)
+		assert.True(t, ok)
+		assert.NotEmpty(t, rootController)
+
+		var seenEvents []string
+
+		// Override the important portions of leasewatcher, and stub out the sub
+		// handler routine to observe start/stop events.
+		leaseEventStatusCh := make(fakeLeaderElector)
+		rootController.newLeaderElector = func(c leaderelection.Config) (leaderElector, error) {
+			return &leaseEventStatusCh, nil
+		}
+		rootController.startSubHandlerRoutine = func(ctx context.Context, logger *logrus.Entry, restartTracker *apsigk0s.RestartTracker, event leaderelection.Status) error {
+			seenEvents = append(seenEvents, "start: "+event.String())
+			<-ctx.Done()
+			seenEvents = append(seenEvents, "stop: "+event.String())
+			return nil
+		}
+
+		var wg sync.WaitGroup
+		ctx, cancel := context.WithCancel(t.Context())
+		t.Cleanup(wg.Wait)
+		t.Cleanup(cancel)
+		wg.Go(func() { assert.NoError(t, rootController.Run(ctx)) })
+
+		// Send alternating lease events, as well as one that is considered redundant
+
+		// The controller will always start in pending state.
+		logger.Info("Awaiting first start")
+		synctest.Wait()
+		require.Equal(t, []string{"start: pending"}, seenEvents)
+		seenEvents = seenEvents[0:0]
+
+		// The first leading status is observed.
+		logger.Info("Sending acquired")
+		leaseEventStatusCh <- leaderelection.StatusLeading
+		synctest.Wait()
+		require.Equal(t, []string{"stop: pending", "start: leading"}, seenEvents)
+		seenEvents = seenEvents[0:0]
+
+		// The second leading status is ignored, as the controller is already in
+		// the right state.
+		logger.Info("Sending acquired (again)")
+		leaseEventStatusCh <- leaderelection.StatusLeading
+		synctest.Wait()
+		require.Empty(t, seenEvents)
+
+		// Finally, the context gets canceled and the controller shuts down.
+		logger.Info("Canceling context")
+		cancel()
+		synctest.Wait()
+		require.Equal(t, []string{"stop: leading"}, seenEvents)
+	})
+}

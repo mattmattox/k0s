@@ -1,33 +1,96 @@
 include embedded-bins/Makefile.variables
 include inttest/Makefile.variables
+include hack/tools/Makefile.variables
 
-GO_SRCS := $(shell find . -type f -name '*.go' -a ! -name 'zz_generated*')
+ifndef HOST_ARCH
+HOST_HARDWARE := $(shell uname -m)
+ifneq (, $(filter $(HOST_HARDWARE), aarch64 arm64))
+  HOST_ARCH := arm64
+else ifneq (, $(filter $(HOST_HARDWARE), armv8l armv7l arm))
+  HOST_ARCH := arm
+else ifneq (, $(filter $(HOST_HARDWARE), riscv64))
+  HOST_ARCH := riscv64
+else
+  ifeq (, $(filter $(HOST_HARDWARE), x86_64 amd64 x64))
+    $(warning unknown machine hardware name $(HOST_HARDWARE), assuming amd64)
+  endif
+  HOST_ARCH := amd64
+endif
+endif
+
+ifeq ($(OS),Windows_NT)
+CYGPATH := $(shell cygpath --version >/dev/null 2>&1 && echo cygpath)
+cygpath = $(if $(CYGPATH),$(shell '$(CYGPATH)' -- '$(1)'),$(1))
+PATHSEP := $(if $(CYGPATH),:,;)
+else
+cygpath = $(1)
+PATHSEP := :
+endif
+
+FIND ?= find
+DOCKER ?= docker
+
+K0S_GO_BUILD_CACHE ?= build/cache
+
+# find evaluates left-to-right: match the dirs first, -prune them (skip their
+# entire subtree without traversing), then -o match the actual .go files. The
+# explicit -print is needed because without it find's implicit -print applies
+# to both sides of -o and would also print the pruned directory names.
+GO_SRCS := $(shell $(FIND) . \( -path "./$(K0S_GO_BUILD_CACHE)" -o -path "./inttest" \) -prune -o -type f -name "*.go" -not -name "*_test.go" -not -name "zz_generated*" -print)
+
+GO_CHECK_UNIT_DIRS := . ./cmd/... ./pkg/... ./internal/... ./static/... ./hack/...
+
+# Disable Docker build integration if DOCKER is set to the empty string.
+ifeq ($(DOCKER),)
+  GO_ENV_REQUISITES ?=
+  GO_ENV ?= PATH='$(call cygpath,$(abspath $(K0S_GO_BUILD_CACHE))/go/bin)$(PATHSEP)'"$$PATH" \
+    GOBIN="$(abspath $(K0S_GO_BUILD_CACHE))/go/bin" \
+    GOCACHE="$(abspath $(K0S_GO_BUILD_CACHE))/go/build" \
+    GOMODCACHE="$(abspath $(K0S_GO_BUILD_CACHE))/go/mod"
+  GO ?= $(GO_ENV) go
+else
+  GO_ENV_REQUISITES ?= .k0sbuild.docker-image.k0s
+  GO_ENV ?= $(DOCKER) run --rm \
+    -v '$(realpath $(K0S_GO_BUILD_CACHE))':/run/k0s-build \
+    -v '$(CURDIR)':/go/src/github.com/k0sproject/k0s \
+    -w /go/src/github.com/k0sproject/k0s \
+    -e GOOS \
+    -e CGO_ENABLED \
+    -e CGO_CFLAGS \
+    -e GOARCH \
+    -e XDG_CACHE_HOME=/run/k0s-build \
+    --user $(BUILD_UID):$(BUILD_GID) \
+    $(DOCKER_RUN_OPTS) -- '$(shell cat .k0sbuild.docker-image.k0s)'
+  GO ?= $(GO_ENV) go
+endif
 
 # EMBEDDED_BINS_BUILDMODE can be either:
 #   docker	builds the binaries in docker
-#   fetch	fetch precompiled binaries from internet
 #   none	does not embed any binaries
-
 EMBEDDED_BINS_BUILDMODE ?= docker
 
-# k0s runs on linux even if its built on mac or windows
+# k0s runs on linux even if it's built on mac or windows
 TARGET_OS ?= linux
-GOARCH ?= $(shell go env GOARCH)
-GOPATH ?= $(shell go env GOPATH)
-BUILD_GO_FLAGS :=
-BUILD_GO_CGO_ENABLED ?= 0
+BUILD_UID ?= $(shell id -u)
+BUILD_GID ?= $(shell id -g)
+BUILD_GO_CGO_ENABLED = 0
+BUILD_GO_TAGS ?= osusergo
+BUILD_GO_FLAGS = -tags=$(subst $(space),$(comma),$(BUILD_GO_TAGS)) -buildvcs=false
+BUILD_CGO_CFLAGS :=
 BUILD_GO_LDFLAGS_EXTRA :=
 DEBUG ?= false
 
-VERSION ?= $(shell git describe --tags)
+VERSION ?= $(shell git describe --tags 2>/dev/null || printf v%s-dev+k0s '$(kubernetes_version)')
 ifeq ($(DEBUG), false)
+BUILD_GO_FLAGS += -trimpath
 LD_FLAGS ?= -w -s
 endif
 
-KUBECTL_VERSION = $(shell go mod graph |  grep "github.com/k0sproject/k0s" |  grep kubectl  | cut -d "@" -f 2 | sed "s/v0\./1./")
-KUBECTL_MAJOR= $(shell echo ${KUBECTL_VERSION} | cut -d "." -f 1)
-KUBECTL_MINOR= $(shell echo ${KUBECTL_VERSION} | cut -d "." -f 2)
-BUILD_DATE = $(shell date ${SOURCE_DATE_EPOCH:+"--date=@${SOURCE_DATE_EPOCH:-}"} -u +'%Y-%m-%dT%H:%M:%SZ')
+# https://reproducible-builds.org/docs/source-date-epoch/#makefile
+# https://reproducible-builds.org/docs/source-date-epoch/#git
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct 2>/dev/null || date -u +%s)
+BUILD_DATE_FMT = %Y-%m-%dT%H:%M:%SZ
+BUILD_DATE ?= $(shell date -u -d "@$(SOURCE_DATE_EPOCH)" "+$(BUILD_DATE_FMT)" 2>/dev/null || date -u -r "$(SOURCE_DATE_EPOCH)" "+$(BUILD_DATE_FMT)" 2>/dev/null || date -u "+$(BUILD_DATE_FMT)")
 
 LD_FLAGS += -X github.com/k0sproject/k0s/pkg/build.Version=$(VERSION)
 LD_FLAGS += -X github.com/k0sproject/k0s/pkg/build.RuncVersion=$(runc_version)
@@ -38,153 +101,343 @@ LD_FLAGS += -X github.com/k0sproject/k0s/pkg/build.EtcdVersion=$(etcd_version)
 LD_FLAGS += -X github.com/k0sproject/k0s/pkg/build.KonnectivityVersion=$(konnectivity_version)
 LD_FLAGS += -X "github.com/k0sproject/k0s/pkg/build.EulaNotice=$(EULA_NOTICE)"
 LD_FLAGS += -X github.com/k0sproject/k0s/pkg/telemetry.segmentToken=$(SEGMENT_TOKEN)
-LD_FLAGS += -X k8s.io/component-base/version.gitVersion="v$(KUBECTL_VERSION)"
-LD_FLAGS += -X k8s.io/component-base/version.gitMajor="$(KUBECTL_MAJOR)"
-LD_FLAGS += -X k8s.io/component-base/version.gitMinor="$(KUBECTL_MINOR)"
+LD_FLAGS += -X k8s.io/component-base/version.gitVersion=v$(kubernetes_version)
+LD_FLAGS += -X k8s.io/component-base/version.gitMajor=$(word 1,$(subst ., ,$(kubernetes_version)))
+LD_FLAGS += -X k8s.io/component-base/version.gitMinor=$(word 2,$(subst ., ,$(kubernetes_version)))
 LD_FLAGS += -X k8s.io/component-base/version.buildDate=$(BUILD_DATE)
-LD_FLAGS += -X k8s.io/component-base/version.gitCommit="not_available"
+LD_FLAGS += -X k8s.io/component-base/version.gitCommit=not_available
+LD_FLAGS += -X github.com/containerd/containerd/v2/version.Version=$(containerd_version)
+LD_FLAGS += -X github.com/containerd/containerd/v2/version.Revision=$(containerd_revision)
 LD_FLAGS += $(BUILD_GO_LDFLAGS_EXTRA)
 
-golint := $(shell which golangci-lint)
-ifeq ($(golint),)
-golint := cd hack/ci-deps && go install github.com/golangci/golangci-lint/cmd/golangci-lint && cd ../.. && "${GOPATH}/bin/golangci-lint"
-endif
+GOLANG_IMAGE ?= $(golang_buildimage)
 
-go_bindata := $(shell which go-bindata)
-ifeq ($(go_bindata),)
-go_bindata := cd hack/ci-deps && go install github.com/kevinburke/go-bindata/... && cd ../.. && "${GOPATH}/bin/go-bindata"
-endif
+# https://www.gnu.org/software/make/manual/make.html#index-spaces_002c-in-variable-values
+nullstring :=
+space := $(nullstring) # space now holds a single space
+comma := ,
 
-GOLANG_IMAGE = golang:1.16-alpine
-GO ?= GOCACHE=/tmp/.cache docker run --rm -v "$(CURDIR)":/go/src/github.com/k0sproject/k0s \
-	-w /go/src/github.com/k0sproject/k0s \
-	-e GOOS \
-	-e CGO_ENABLED \
-	-e GOARCH \
-	-e GOCACHE \
-	--user $$(id -u) \
-	$(GOLANG_IMAGE) go
+.DELETE_ON_ERROR:
 
 .PHONY: build
 ifeq ($(TARGET_OS),windows)
 build: k0s.exe
 else
+BUILD_GO_LDFLAGS_EXTRA = -extldflags=-static
 build: k0s
 endif
-
-.k0sbuild.docker-image.k0s:
-	docker build --rm -t k0sbuild.docker-image.k0s -f build/Dockerfile .
-	touch $@
-
-.k0sbuild.docker-image.k0s: build/Dockerfile
 
 .PHONY: all
 all: k0s k0s.exe
 
-zz_os = $(patsubst pkg/assets/zz_generated_offsets_%.go,%,$@)
-ifeq ($(EMBEDDED_BINS_BUILDMODE),none)
-pkg/assets/zz_generated_offsets_linux.go pkg/assets/zz_generated_offsets_windows.go:
-	rm -f bindata_$(zz_os) && touch bindata_$(zz_os)
-	printf "%s\n\n%s\n%s\n" \
-		"package assets" \
-		"var BinData = map[string]struct{ offset, size int64 }{}" \
-		"var BinDataSize int64 = 0" \
-		> $@
-else
-pkg/assets/zz_generated_offsets_linux.go: .bins.linux.stamp
-pkg/assets/zz_generated_offsets_windows.go: .bins.windows.stamp
-pkg/assets/zz_generated_offsets_linux.go pkg/assets/zz_generated_offsets_windows.go: .k0sbuild.docker-image.k0s
-	GOOS=${GOHOSTOS} $(GO) run hack/gen-bindata/main.go -o bindata_$(zz_os) -pkg assets \
-	     -gofile pkg/assets/zz_generated_offsets_$(zz_os).go \
-	     -prefix embedded-bins/staging/$(zz_os)/ embedded-bins/staging/$(zz_os)/bin
+$(K0S_GO_BUILD_CACHE):
+	mkdir -p -- '$@'
+
+.k0sbuild.docker-image.k0s: build/Dockerfile embedded-bins/Makefile.variables | $(K0S_GO_BUILD_CACHE)
+	$(DOCKER) build --progress=plain --iidfile '$@' \
+	  --build-arg BUILDKIT_DOCKERFILE_CHECK=skip=InvalidDefaultArgInFrom \
+	  --build-arg BUILDIMAGE=$(GOLANG_IMAGE) \
+	  -t k0sbuild.docker-image.k0s - <build/Dockerfile
+
+go.sum: go.mod $(GO_ENV_REQUISITES)
+	$(GO) mod tidy && touch -c -- '$@'
+
+# List of all the custom APIs that k0s defines.
+api_group_versions := $(foreach path,$(wildcard pkg/apis/*/v*/doc.go),$(path:pkg/apis/%/doc.go=%))
+
+# Declare the requisites for the generators operating on API group versions.
+api_group_version_targets := .controller-gen.stamp zz_generated.register.go
+$(foreach gv,$(api_group_versions),$(eval $(foreach t,$(api_group_version_targets),pkg/apis/$(gv)/$(t)): $$(shell $(FIND) pkg/apis/$(gv)/ -maxdepth 1 -type f -name "*.go" -not -name "*_test.go" -not -name "zz_generated*")))
+
+# Run controller-gen for each API group version.
+controller_gen_targets := $(foreach gv,$(api_group_versions),pkg/apis/$(gv)/.controller-gen.stamp)
+codegen_targets := $(controller_gen_targets)
+$(controller_gen_targets): $(GO_ENV_REQUISITES) hack/tools/boilerplate.go.txt hack/tools/Makefile.variables
+	rm -rf 'static/_crds/$(dir $(@:pkg/apis/%/.controller-gen.stamp=%))'
+	gendir="$$(mktemp -d .controller-gen.tmp.XXXXXX)" \
+	  && trap "rm -rf -- $$gendir" INT EXIT \
+	  && CGO_ENABLED=0 $(GO) run sigs.k8s.io/controller-tools/cmd/controller-gen@v$(controller-tools_version) \
+	    paths="./$(dir $@)..." \
+	    object:headerFile=hack/tools/boilerplate.go.txt output:object:dir="$$gendir" \
+	    crd output:crd:dir='static/_crds/$(dir $(@:pkg/apis/%/.controller-gen.stamp=%))' \
+	  && mv -f -- "$$gendir"/zz_generated.deepcopy.go '$(dir $@).'
+	touch -- '$@'
+
+# Run register-gen for each API group version.
+register_gen_targets := $(foreach gv,$(api_group_versions),pkg/apis/$(gv)/zz_generated.register.go)
+codegen_targets += $(register_gen_targets)
+$(register_gen_targets): $(GO_ENV_REQUISITES) hack/tools/boilerplate.go.txt embedded-bins/Makefile.variables
+	CGO_ENABLED=0 $(GO) run k8s.io/code-generator/cmd/register-gen@v$(kubernetes_version:1.%=0.%) \
+	  --go-header-file=hack/tools/boilerplate.go.txt \
+	  --output-file='_$(notdir $@).tmp' \
+	  'github.com/k0sproject/k0s/$(dir $@)' || { \
+	    ret=$$?; \
+	    rm -f -- '$(dir $@)_$(notdir $@).tmp'; \
+	    exit $$ret; \
+	  }
+	mv -- '$(dir $@)_$(notdir $@).tmp' '$@'
+
+# Generate the k0s client-go clientset based on all custom API group versions.
+clientset_input_dirs := $(foreach gv,$(api_group_versions),pkg/apis/$(gv))
+codegen_targets += pkg/client/clientset/.client-gen.stamp
+pkg/client/clientset/.client-gen.stamp: $(shell $(FIND) $(clientset_input_dirs) -type f -name "*.go" -not -name "*_test.go" -not -name "zz_generated*")
+pkg/client/clientset/.client-gen.stamp: $(GO_ENV_REQUISITES) hack/tools/boilerplate.go.txt embedded-bins/Makefile.variables
+	gendir="$$(mktemp -d .client-gen.tmp.XXXXXX)" \
+	  && trap "rm -rf -- $$gendir" INT EXIT \
+	  && CGO_ENABLED=0 $(GO) run k8s.io/code-generator/cmd/client-gen@v$(kubernetes_version:1.%=0.%) \
+	    --go-header-file=hack/tools/boilerplate.go.txt \
+	    --input-base='' \
+	    --input=$(subst $(space),$(comma),$(clientset_input_dirs:%=github.com/k0sproject/k0s/%)) \
+	    --output-pkg=github.com/k0sproject/k0s/pkg/client \
+	    --clientset-name=clientset \
+	    --output-dir="$$gendir/out" \
+	  && { [ ! -e pkg/client/clientset ] || mv -- pkg/client/clientset "$$gendir/old"; } \
+	  && mv -f -- "$$gendir/out/clientset" pkg/client/.
+	touch -- '$@'
+
+embedded-binaries-linux.zip: .bins.linux.stamp
+embedded-binaries-windows.zip: .bins.windows.stamp
+embedded-binaries-linux.zip embedded-binaries-windows.zip: $(GO_ENV_REQUISITES) go.sum hack/zip-files/* embedded-bins/Makefile.variables
+	CGO_ENABLED=0 $(GO) run -tags=hack hack/zip-files/main.go embedded-bins/staging/$(@:embedded-binaries-%.zip=%)/bin/* >$@
+
+ifneq ($(EMBEDDED_BINS_BUILDMODE),none)
+k0s: embedded-binaries-linux.zip
+k0s.exe: embedded-binaries-windows.zip
 endif
 
+k0s k0s.bare: TARGET_OS = linux
+k0s.exe k0s.bare.exe: TARGET_OS = windows
 
-k0s: TARGET_OS = linux
-k0s: pkg/assets/zz_generated_offsets_linux.go
-k0s: BUILD_GO_CGO_ENABLED = 1
-k0s: GOLANG_IMAGE = "k0sbuild.docker-image.k0s"
-k0s: BUILD_GO_LDFLAGS_EXTRA = -extldflags=-static
-k0s: .k0sbuild.docker-image.k0s
+.INTERMEDIATE: k0s.bare k0s.bare.exe
+k0s.bare.exe k0s.bare: $(GO_ENV_REQUISITES) go.sum $(codegen_targets) $(GO_SRCS) $(shell find static/manifests/calico static/manifests/windows -type f)
+	CGO_ENABLED=$(BUILD_GO_CGO_ENABLED) CGO_CFLAGS='$(BUILD_CGO_CFLAGS)' GOOS=$(TARGET_OS) $(GO) build $(BUILD_GO_FLAGS) -ldflags='$(LD_FLAGS)' -o '$@' main.go
 
-k0s.exe: TARGET_OS = windows
-k0s.exe: BUILD_GO_CGO_ENABLED = 0
-k0s.exe: GOLANG_IMAGE = golang:1.16-alpine
-k0s.exe: pkg/assets/zz_generated_offsets_windows.go
+k0s: k0s.bare
+k0s.exe: k0s.bare.exe
 
-k0s.exe k0s: static/gen_manifests.go
-
-k0s.exe k0s: $(GO_SRCS)
-	CGO_ENABLED=$(BUILD_GO_CGO_ENABLED) GOOS=$(TARGET_OS) GOARCH=$(GOARCH) $(GO) build $(BUILD_GO_FLAGS) -ldflags='$(LD_FLAGS)' -o $@.code main.go
-	cat $@.code bindata_$(TARGET_OS) > $@.tmp \
-		&& rm -f $@.code \
-		&& chmod +x $@.tmp \
-		&& mv $@.tmp $@
+k0s.exe k0s:
+	mv $(@:k0s%=k0s.bare%) $@
+ifneq ($(EMBEDDED_BINS_BUILDMODE),none)
+	cat embedded-binaries-$(TARGET_OS).zip >>$@
+endif
+	@printf '\n%s size: %s\n\n' '$@' "$$(du -sh -- $@ | cut -f1)"
 
 .bins.windows.stamp .bins.linux.stamp: embedded-bins/Makefile.variables
-	$(MAKE) -C embedded-bins buildmode=$(EMBEDDED_BINS_BUILDMODE) TARGET_OS=$(patsubst .bins.%.stamp,%,$@)
+	$(MAKE) -C embedded-bins \
+	  TARGET_OS=$(patsubst .bins.%.stamp,%,$@) \
+	  SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH)
 	touch $@
 
-SKIP_GOMOD_LINT ?= false
-ifeq ($(SKIP_GOMOD_LINT), false)
-GOMODLINT=lint-gomod
-endif
+.PHONY: codegen
+codegen: $(codegen_targets)
+
+.PHONY: list-images
+list-images:
+	@$(GO) run ./hack/list-images
+
+.PHONY: lint-copyright
+lint-copyright:
+	hack/copyright.sh
+
+.PHONY: lint-invisible-unicode
+lint-invisible-unicode:
+	@set -eu; \
+	echo Checking tracked files for invisible Unicode format characters ...; \
+	{ \
+	  git grep -I --line-number --perl-regexp \
+	    -e '\x{00A0}' `# U+00A0 NO-BREAK SPACE` \
+	    -e '\x{00AD}' `# U+00AD SOFT HYPHEN` \
+	    -e '\x{1680}' `# U+1680 OGHAM SPACE MARK` \
+	    -e '\x{2000}' `# U+2000 EN QUAD` \
+	    -e '\x{2001}' `# U+2001 EM QUAD` \
+	    -e '\x{2002}' `# U+2002 EN SPACE` \
+	    -e '\x{2003}' `# U+2003 EM SPACE` \
+	    -e '\x{2004}' `# U+2004 THREE-PER-EM SPACE` \
+	    -e '\x{2005}' `# U+2005 FOUR-PER-EM SPACE` \
+	    -e '\x{2006}' `# U+2006 SIX-PER-EM SPACE` \
+	    -e '\x{2007}' `# U+2007 FIGURE SPACE` \
+	    -e '\x{2008}' `# U+2008 PUNCTUATION SPACE` \
+	    -e '\x{2009}' `# U+2009 THIN SPACE` \
+	    -e '\x{200A}' `# U+200A HAIR SPACE` \
+	    -e '\x{200B}' `# U+200B ZERO WIDTH SPACE` \
+	    -e '\x{200C}' `# U+200C ZERO WIDTH NON-JOINER` \
+	    -e '\x{200D}' `# U+200D ZERO WIDTH JOINER` \
+	    -e '\x{200E}' `# U+200E LEFT-TO-RIGHT MARK` \
+	    -e '\x{200F}' `# U+200F RIGHT-TO-LEFT MARK` \
+	    -e '\x{2028}' `# U+2028 LINE SEPARATOR` \
+	    -e '\x{2029}' `# U+2029 PARAGRAPH SEPARATOR` \
+	    -e '\x{202A}' `# U+202A LEFT-TO-RIGHT EMBEDDING` \
+	    -e '\x{202B}' `# U+202B RIGHT-TO-LEFT EMBEDDING` \
+	    -e '\x{202C}' `# U+202C POP DIRECTIONAL FORMATTING` \
+	    -e '\x{202D}' `# U+202D LEFT-TO-RIGHT OVERRIDE` \
+	    -e '\x{202E}' `# U+202E RIGHT-TO-LEFT OVERRIDE` \
+	    -e '\x{202F}' `# U+202F NARROW NO-BREAK SPACE` \
+	    -e '\x{205F}' `# U+205F MEDIUM MATHEMATICAL SPACE` \
+	    -e '\x{2060}' `# U+2060 WORD JOINER` \
+	    -e '\x{2066}' `# U+2066 LEFT-TO-RIGHT ISOLATE` \
+	    -e '\x{2067}' `# U+2067 RIGHT-TO-LEFT ISOLATE` \
+	    -e '\x{2068}' `# U+2068 FIRST STRONG ISOLATE` \
+	    -e '\x{2069}' `# U+2069 POP DIRECTIONAL ISOLATE` \
+	    -e '\x{3000}' `# U+3000 IDEOGRAPHIC SPACE` \
+	    -e '\x{FEFF}' `# U+FEFF ZERO WIDTH NO-BREAK SPACE / BOM` \
+	  || { [ $$? -eq 1 ] || echo ~; }; \
+	} | { \
+	  numMatches=0; \
+	  while IFS= read -r match; do \
+	    [ "$$match" != ~ ] || exit 1; \
+	    [ -z "$$match" ] && continue; \
+	    numMatches=$$((numMatches + 1)); \
+	    file="$${match%%:*}"; \
+	    rest="$${match#*:}"; \
+	    line="$${rest%%:*}"; \
+	    echo "::error file=$$file,line=$$line,title=Invisible Unicode format character::Found a disallowed invisible Unicode character. Remove it."; \
+	  done; \
+	  if [ "$$numMatches" -eq 0 ]; then \
+	    echo No invisible Unicode format characters found.; \
+	  else \
+	    exit 1; \
+	  fi \
+	}
+
+.PHONY: lint-go
+lint-go: GOLANGCI_LINT_FLAGS ?=
+lint-go: $(GO_ENV_REQUISITES) go.sum
+	CGO_ENABLED=0 $(GO) install github.com/golangci/golangci-lint/v$(word 1,$(subst ., ,$(golangci-lint_version)))/cmd/golangci-lint@v$(golangci-lint_version)
+	GOLANGCI_LINT_CACHE='$(abspath $(K0S_GO_BUILD_CACHE))/golangci-lint' GO_CFLAGS='$(BUILD_CGO_CFLAGS)' $(GO_ENV) golangci-lint run --verbose --build-tags=$(subst $(space),$(comma),$(BUILD_GO_TAGS)) $(GOLANGCI_LINT_FLAGS) $(GO_LINT_DIRS)
 
 .PHONY: lint
-lint: pkg/assets/zz_generated_offsets_$(TARGET_OS).go ${GOMODLINT}
-	$(golint) run ./...
+lint: lint-copyright lint-go
+
+airgap-images-linux-amd64.txt airgap-image-bundle-linux-amd64.tar:             TARGET_PLATFORM := linux/amd64
+airgap-images-linux-arm64.txt airgap-image-bundle-linux-arm64.tar:             TARGET_PLATFORM := linux/arm64
+airgap-images-linux-arm.txt airgap-image-bundle-linux-arm.tar:                 TARGET_PLATFORM := linux/arm/v7
+airgap-images-linux-riscv64.txt airgap-image-bundle-linux-riscv64.tar:         TARGET_PLATFORM := linux/riscv64
+airgap-images-windows2022-amd64.txt airgap-image-bundle-windows2022-amd64.tar: TARGET_PLATFORM := windows(10.0.20348)/amd64
+
+airgap-images-linux-amd64.txt \
+airgap-images-linux-arm64.txt \
+airgap-images-linux-arm.txt \
+airgap-images-linux-riscv64.txt \
+airgap-images-windows2022-amd64.txt: k0s $(GO_ENV_REQUISITES)
+	$(GO_ENV) ./k0s airgap list-images --all --platform='$(TARGET_PLATFORM)' > '$@'
+
+airgap-image-bundle-linux-amd64.tar:       airgap-images-linux-amd64.txt
+airgap-image-bundle-linux-arm64.tar:       airgap-images-linux-arm64.txt
+airgap-image-bundle-linux-arm.tar:         airgap-images-linux-arm.txt
+airgap-image-bundle-linux-riscv64.tar:     airgap-images-linux-riscv64.txt
+airgap-image-bundle-windows2022-amd64.tar: airgap-images-windows2022-amd64.txt
+
+airgap-image-bundle-linux-amd64.tar \
+airgap-image-bundle-linux-arm64.tar \
+airgap-image-bundle-linux-arm.tar \
+airgap-image-bundle-linux-riscv64.tar \
+airgap-image-bundle-windows2022-amd64.tar: k0s
+	set -- $$(cat -- '$(@:airgap-image-bundle-%.tar=airgap-images-%.txt)') && \
+	$(GO_ENV) ./k0s airgap bundle-artifacts --concurrency=1 -v --platform='$(TARGET_PLATFORM)' -o '$@' "$$@"
+	chmod a+r '$@'
+
+ipv6-test-images-linux-amd64.txt ipv6-test-image-bundle-linux-amd64.tar: TARGET_PLATFORM := linux/amd64
+ipv6-test-images-linux-arm64.txt ipv6-test-image-bundle-linux-arm64.tar: TARGET_PLATFORM := linux/arm64
+
+ipv6-test-images-linux-amd64.txt \
+ipv6-test-images-linux-arm64.txt: $(GO_ENV_REQUISITES) embedded-bins/Makefile.variables inttest/Makefile.variables hack/gen-test-images-list/main.go inttest/common/ociimages/images.go
+	{ \
+	  echo "$(alpine_image)"; \
+	  echo "$(sonobuoy_image)"; \
+	  echo "registry.k8s.io/conformance:v$(kubernetes_version)"; \
+	  $(GO) run -tags=hack ./hack/gen-test-images-list; \
+	} >'$@'
+
+ipv6-test-image-bundle-linux-amd64.tar: ipv6-test-images-linux-amd64.txt
+ipv6-test-image-bundle-linux-arm64.tar: ipv6-test-images-linux-arm64.txt
+
+ipv6-test-image-bundle-linux-amd64.tar \
+ipv6-test-image-bundle-linux-arm64.tar: k0s
+	set -- $$(cat -- '$(@:ipv6-test-image-bundle-%.tar=ipv6-test-images-%.txt)') && \
+	$(GO_ENV) ./k0s airgap bundle-artifacts -v --platform='$(TARGET_PLATFORM)' -o '$@' "$$@"
 
 .PHONY: $(smoketests)
-check-airgap: image-bundle/bundle.tar
+$(air_gapped_smoketests) $(ipv6_smoketests): airgap-image-bundle-linux-$(HOST_ARCH).tar
+
+ifneq ($(filter amd64 arm64,$(HOST_ARCH)),)
+$(ipv6_smoketests): ipv6-test-image-bundle-linux-$(HOST_ARCH).tar
+IPV6_TEST_IMAGE_BUNDLE := $(CURDIR)/ipv6-test-image-bundle-linux-$(HOST_ARCH).tar
+endif
+
 $(smoketests): k0s
-	$(MAKE) -C inttest $@
+	$(MAKE) -C inttest \
+		K0S_IMAGES_BUNDLE='$(CURDIR)/airgap-image-bundle-linux-$(HOST_ARCH).tar' \
+		K0S_EXTRA_IMAGES_BUNDLE='$(IPV6_TEST_IMAGE_BUNDLE)' \
+		$@
 
 .PHONY: smoketests
-smoketests:  $(smoketests)
-
+smoketests: $(smoketests)
 
 .PHONY: check-unit
-check-unit: pkg/assets/zz_generated_offsets_$(TARGET_OS).go static/gen_manifests.go
-	go test -race ./pkg/... ./internal/...
+ifneq (, $(filter $(HOST_ARCH), arm riscv64))
+check-unit: GO_TEST_RACE ?=
+else
+check-unit: GO_TEST_RACE ?= -race
+endif
+ifeq ($(HOST_ARCH), arm)
+# Externally linked arm test binaries hit a Go-vs-ld branch veneer bug
+check-unit: export CGO_ENABLED ?= 0
+endif
+check-unit: BUILD_GO_TAGS += hack
+check-unit: $(GO_ENV_REQUISITES) go.sum
+	CGO_CFLAGS='$(BUILD_CGO_CFLAGS)' $(GO) test -tags=$(subst $(space),$(comma),$(BUILD_GO_TAGS)) $(GO_TEST_RACE) -ldflags='$(LD_FLAGS)' `$(GO) list -tags=$(subst $(space),$(comma),$(BUILD_GO_TAGS)) $(GO_CHECK_UNIT_DIRS)`
+
+.PHONY: clean-gocache
+clean-gocache:
+	-chmod -R u+w '$(K0S_GO_BUILD_CACHE)/go/mod'
+	rm -rf -- '$(K0S_GO_BUILD_CACHE)/go'
+
+.PHONY: clean-docker-image
+clean-docker-image: IID_FILES = .k0sbuild.docker-image.k0s
+clean-docker-image:
+	$(clean-iid-files)
+
+.PHONY: clean-image-bundles
+clean-image-bundles:
+	for plat in linux-amd64 linux-arm64 linux-arm linux-riscv64 windows2022-amd64; do \
+	  rm -f airgap-images-$$plat.txt airgap-image-bundle-$$plat.tar; \
+	  rm -f ipv6-test-images-$$plat.txt ipv6-test-image-bundle-$$plat.tar; \
+	done
 
 .PHONY: clean
-clean:
-	-rm -f pkg/assets/zz_generated_offsets_*.go k0s k0s.exe .bins.*stamp bindata* static/gen_manifests.go .k0sbuild.docker-image.k0s
-	-docker rmi k0sbuild.docker-image.k0s -f
+clean: clean-gocache clean-docker-image clean-image-bundles
+	-rm -f k0s k0s.exe k0s.bare k0s.bare.exe .bins.*stamp
+	-rm -f embedded-binaries-linux.zip embedded-binaries-windows.zip
+	-rm -rf $(K0S_GO_BUILD_CACHE)
+	-find pkg/apis -type f -name .controller-gen.stamp -delete
+	-rm pkg/client/clientset/.client-gen.stamp
+	-rm -f hack/.copyright.stamp
+	-rm -f spdx.json
+	-$(MAKE) -C docs clean
 	-$(MAKE) -C embedded-bins clean
-	-$(MAKE) -C image-bundle clean
 	-$(MAKE) -C inttest clean
 
-.PHONY: manifests
-manifests:
-	controller-gen crd paths="./..." output:crd:artifacts:config=static/manifests/helm/CustomResourceDefinition object
+.PHONY: docs
+docs:
+	$(MAKE) -C docs
 
-static/gen_manifests.go: $(shell find static/manifests -type f)
-	$(go_bindata) -o static/gen_manifests.go -pkg static -prefix static static/...
+.PHONY: docs-serve-dev
+docs-serve-dev: DOCS_DEV_PORT ?= 8000
+docs-serve-dev:
+	$(MAKE) -C docs .docker-image.serve-dev.stamp
+	$(DOCKER) run --rm \
+	  -e PYTHONPATH=/k0s/docs/mkdocs_modules \
+	  -e K0S_VERSION=$(VERSION) \
+	  -v "$(CURDIR):/k0s:ro" \
+	  -p '$(DOCS_DEV_PORT):8000' \
+	  $(DOCKER_RUN_OPTS) k0sdocs.docker-image.serve-dev
 
-.PHONY: generate-bindata
-generate-bindata: pkg/assets/zz_generated_offsets_$(TARGET_OS).go
-
-image-bundle/image.list: k0s
-	./k0s airgap list-images > image-bundle/image.list
-
-image-bundle/bundle.tar: image-bundle/image.list
-	$(MAKE) -C image-bundle bundle.tar
-
-
-GOMODTIDYLINT=sh -c '\
-if [ `git diff go.mod go.sum | wc -l` -gt "0" ]; then \
-	echo "Run \`go mod tidy\` and commit the result"; \
-	exit 1; \
-fi ; \
-${GO} mod tidy; \
-if [ `git diff go.mod go.sum | wc -l` -gt "0" ]; then \
- git checkout go.mod go.sum ; \
- echo "Linter failure: go.mod and go.sum have unused deps. Run \`go mod tidy\` and commit the result"; \
- exit 2; \
-fi \
- ; ' GOMODTIDYLINT
-
-lint-gomod:
-	@${GOMODTIDYLINT}
-
+spdx.json: syft.yaml go.mod .bins.$(TARGET_OS).stamp
+	$(DOCKER) run --rm \
+	  -v '$(CURDIR)/syft.yaml':/k0s/syft.yaml:ro \
+	  -v '$(CURDIR)/go.mod':/k0s/go.mod:ro \
+	  -v '$(CURDIR)/embedded-bins/staging/$(TARGET_OS)/bin':/k0s/bin:ro \
+	  -w /k0s \
+	  $(DOCKER_RUN_OPTS) docker.io/anchore/syft:v1.57.1@sha256:03215d0e98b661d0ecbc8575dbc14d65be1743b5de5df6410aecb7e80f95b060 \
+	  --source-name k0s --source-version '$(VERSION)' \
+	  -c syft.yaml -o spdx-json@2.2 . >'$@'

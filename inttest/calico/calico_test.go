@@ -1,41 +1,76 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package calico
 
 import (
 	"context"
+	"net"
+	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/suite"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/yaml"
 
 	"github.com/k0sproject/k0s/inttest/common"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"github.com/k0sproject/k0s/inttest/common/ociimages"
+	"github.com/k0sproject/k0s/pkg/apis/k0s/v1beta1"
 )
 
 type CalicoSuite struct {
-	common.FootlooseSuite
+	common.BootlooseSuite
+	isIPv6Only bool
 }
 
 func (s *CalicoSuite) TestK0sGetsUp() {
-	s.PutFile(s.ControllerNode(0), "/tmp/k0s.yaml", k0sConfig)
-	s.Require().NoError(s.InitController(0, "--config=/tmp/k0s.yaml"))
+	ctx := s.Context()
+
+	{
+		clusterCfg := &v1beta1.ClusterConfig{
+			Spec: &v1beta1.ClusterSpec{
+				Network: func() *v1beta1.Network {
+					network := v1beta1.DefaultNetwork()
+					network.Provider = "calico"
+					network.Calico = &v1beta1.Calico{
+						EnvVars: map[string]string{
+							"TEST_BOOL_VAR":   "true",
+							"TEST_INT_VAR":    "42",
+							"TEST_STRING_VAR": "test",
+						},
+					}
+					return network
+				}(),
+			},
+		}
+		if s.isIPv6Only {
+			clusterCfg.Spec.Network.PodCIDR = "fd00::/108"
+			clusterCfg.Spec.Network.ServiceCIDR = "fd01::/108"
+		}
+
+		config, err := yaml.Marshal(clusterCfg)
+		s.Require().NoError(err)
+		s.WriteFileContent(s.ControllerNode(0), "/tmp/k0s.yaml", config)
+	}
+
+	s.Require().NoError(s.InitController(0, "--config=/tmp/k0s.yaml", "--feature-gates=IPv6SingleStack=true"))
+
+	if s.isIPv6Only {
+		s.T().Log("Setting up IPv6 DNS for workers")
+		common.ConfigureIPv6ResolvConf(&s.BootlooseSuite)
+	}
 	s.Require().NoError(s.RunWorkers())
 
-	kc, err := s.KubeClient("controller0", "")
+	restConfig, err := s.GetKubeConfig(s.ControllerNode(0), "")
 	s.NoError(err)
+	kc, err := kubernetes.NewForConfig(restConfig)
+	s.Require().NoError(err)
 
 	err = s.WaitForNodeReady("worker0", kc)
 	s.NoError(err)
@@ -43,33 +78,101 @@ func (s *CalicoSuite) TestK0sGetsUp() {
 	err = s.WaitForNodeReady("worker1", kc)
 	s.NoError(err)
 
-	pods, err := kc.CoreV1().Pods("kube-system").List(context.TODO(), v1.ListOptions{
-		Limit: 100,
-	})
-	s.NoError(err)
+	calicoDaemonset, err := kc.AppsV1().DaemonSets(metav1.NamespaceSystem).Get(ctx, "calico-node", metav1.GetOptions{})
+	s.Require().NoError(err)
+	var calicoCustomEnvVarsFound int
+	for _, v := range calicoDaemonset.Spec.Template.Spec.Containers[0].Env {
+		if v.Name == "TEST_BOOL_VAR" || v.Name == "TEST_INT_VAR" || v.Name == "TEST_STRING_VAR" {
+			calicoCustomEnvVarsFound++
+		}
+	}
+	s.Equal(3, calicoCustomEnvVarsFound, "expecting to see custom calico env vars")
 
-	podCount := len(pods.Items)
-
-	s.T().Logf("found %d pods in kube-system", podCount)
-	s.Greater(podCount, 0, "expecting to see few pods in kube-system namespace")
+	s.AssertSomeKubeSystemPods(kc)
 
 	s.T().Log("waiting to see calico pods ready")
-	s.NoError(common.WaitForCalicoReady(kc), "calico did not start")
+	s.NoError(common.WaitForDaemonSet(ctx, kc, "calico-node", metav1.NamespaceSystem), "calico did not start")
+	s.Require().NoError(common.VerifyKonnectivityMesh(ctx, restConfig, kc, s.T(), uint(s.ControllerCount), uint(s.WorkerCount)), "While verifying konnectivity mesh")
+
+	createdTargetPod, err := kc.CoreV1().Pods(metav1.NamespaceDefault).Create(ctx, &corev1.Pod{
+		TypeMeta:   metav1.TypeMeta{Kind: "Pod", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "nginx"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:  "nginx",
+				Image: ociimages.Nginx,
+				ReadinessProbe: &corev1.Probe{
+					ProbeHandler: corev1.ProbeHandler{
+						HTTPGet: &corev1.HTTPGetAction{
+							Path:   "/",
+							Port:   intstr.FromInt(80),
+							Scheme: corev1.URISchemeHTTP,
+						},
+					},
+				},
+			}},
+			NodeSelector: map[string]string{
+				"kubernetes.io/hostname": "worker0",
+			},
+		},
+	}, metav1.CreateOptions{})
+	s.Require().NoError(err)
+	s.Require().NoError(common.WaitForPod(ctx, kc, "nginx", metav1.NamespaceDefault), "nginx pod did not start")
+
+	targetPod, err := kc.CoreV1().Pods(createdTargetPod.Namespace).Get(ctx, createdTargetPod.Name, metav1.GetOptions{})
+	s.Require().NoError(err)
+
+	alpineImage, err := ociimages.Alpine(ctx)
+	s.Require().NoError(err)
+	sourcePod, err := kc.CoreV1().Pods(metav1.NamespaceDefault).Create(ctx, &corev1.Pod{
+		TypeMeta:   metav1.TypeMeta{Kind: "Pod", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "alpine"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:    "alpine",
+				Image:   alpineImage,
+				Command: []string{"sleep", "infinity"},
+			}},
+			NodeSelector: map[string]string{
+				"kubernetes.io/hostname": "worker1",
+			},
+		},
+	}, metav1.CreateOptions{})
+	s.Require().NoError(err)
+	s.NoError(common.WaitForPod(ctx, kc, "alpine", metav1.NamespaceDefault), "alpine pod did not start")
+
+	err = wait.PollImmediateWithContext(ctx, 100*time.Millisecond, time.Minute, func(ctx context.Context) (done bool, err error) {
+		out, err := common.PodExecCmdOutput(kc, restConfig, sourcePod.Name, sourcePod.Namespace,
+			"/usr/bin/wget -qO- "+net.JoinHostPort(targetPod.Status.PodIP, "80"))
+		if err != nil {
+			s.T().Log("Error calling nginx pod:", err)
+			return false, nil
+		}
+		s.T().Log("server response", out)
+		return strings.Contains(out, "Welcome to nginx"), nil
+	})
+	s.Require().NoError(err)
+
+	// After the tests finished, verify that there are no restarted pods
+	for _, err := range common.VerifyNoRestartedPods(ctx, kc) {
+		s.NoError(err)
+	}
 }
 
 func TestCalicoSuite(t *testing.T) {
 	s := CalicoSuite{
-		common.FootlooseSuite{
+		BootlooseSuite: common.BootlooseSuite{
 			ControllerCount: 1,
 			WorkerCount:     2,
 		},
 	}
+
+	if strings.Contains(os.Getenv("K0S_INTTEST_TARGET"), "ipv6") {
+		t.Log("Configuring IPv6 only networking")
+		s.isIPv6Only = true
+		s.Networks = []string{"bridge-ipv6"}
+		s.AirgapImageBundleMountPoints = []string{"/var/lib/k0s/images/bundle.tar"}
+		s.K0sExtraImageBundleMountPoints = []string{"/var/lib/k0s/images/ipv6.tar"}
+	}
 	suite.Run(t, &s)
 }
-
-const k0sConfig = `
-spec:
-  network:
-    provider: calico
-    calico:
-`

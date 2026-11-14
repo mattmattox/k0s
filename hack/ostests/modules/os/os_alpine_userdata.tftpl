@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+
+truncate -s0 /etc/motd
+
+%{if worker}
+rc-update add cgroups boot
+/etc/init.d/cgroups start
+%{endif}

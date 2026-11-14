@@ -1,0 +1,182 @@
+//go:build unix
+
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
+
+package k0s
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	autopilotv1beta2 "github.com/k0sproject/k0s/pkg/apis/autopilot/v1beta2"
+	"github.com/k0sproject/k0s/pkg/autopilot/constant"
+	apdel "github.com/k0sproject/k0s/pkg/autopilot/controller/delegate"
+	apsigpred "github.com/k0sproject/k0s/pkg/autopilot/controller/signal/common/predicate"
+	"github.com/k0sproject/k0s/pkg/component/status"
+	"github.com/k0sproject/k0s/pkg/leaderelection"
+
+	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	applycoordinationv1 "k8s.io/client-go/applyconfigurations/coordination/v1"
+
+	"github.com/sirupsen/logrus"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	crman "sigs.k8s.io/controller-runtime/pkg/manager"
+	crpred "sigs.k8s.io/controller-runtime/pkg/predicate"
+)
+
+// Registers all of the autopilot controllers used for updating k0s to the
+// controller-runtime manager. The restart tracker's lifetime needs to be tied
+// to the process, i.e. it has to be shared by all the managers this function is
+// called with throughout the lifetime of the process.
+func RegisterControllers(ctx context.Context, logger *logrus.Entry, mgr crman.Manager, delegate apdel.ControllerDelegate, nodeName types.NodeName, restartTracker *RestartTracker, enableWorker bool, clusterID string, leaseStatus leaderelection.Status) error {
+	if restartTracker == nil {
+		return errors.New("restart tracker is required")
+	}
+
+	logger = logger.WithField("controller", delegate.Name())
+
+	k0sBinaryPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("unable to determine k0s binary path: %w", err)
+	}
+	k0sBinaryDir := filepath.Dir(k0sBinaryPath)
+
+	logger.Infof("Using node name = '%v'", nodeName)
+
+	k0sVersionHandler := func() (string, error) {
+		return getK0sVersion(status.DefaultSocketPath)
+	}
+
+	if enableWorker {
+		// Stamp the node lease with the central cordoning label to signal to
+		// the autopilot controller that this worker supports central cordoning.
+		// Note that if k0s is downgraded to a version that no longer supports
+		// central cordoning, the label will remain in place, and there will be
+		// no way to detect that this has become stale.
+		//
+		// TODO: Remove in v1.37+ and add some cleanup code to remove the
+		// then-unused label.
+		c := mgr.GetClient()
+		if err := c.Apply(ctx, applycoordinationv1.
+			Lease(string(nodeName), corev1.NamespaceNodeLease).
+			WithLabels(map[string]string{constant.CentralCordoningLabel: ""}),
+			client.FieldOwner("k0s/autopilot"), client.ForceOwnership); err != nil {
+			return fmt.Errorf("unable to apply lease labels: %w", err)
+		}
+
+		// The kubelet only sets the holder identity when creating a new lease
+		// from scratch, not when renewing an existing one. The above apply call
+		// may very well happen before the kubelet has had a chance to create
+		// the lease. As a result, the kubelet finds an existing lease in place
+		// and only updates the renewal time, leaving the holder identity unset.
+		//
+		// Work around this by sending a conditional patch that will set the
+		// holder identity if it has not already been set. If the identity has
+		// already been set, the patch will fail with an "Invalid" error. We
+		// treat this as a success.
+		//
+		// TODO: Remove in v1.37+. This workaround will no longer be necessary
+		// once the apply call above is gone.
+		patch, err := json.Marshal([]struct {
+			Op    string `json:"op"`
+			Path  string `json:"path"`
+			Value string `json:"value,omitempty"`
+		}{
+			{"test", "/spec/holderIdentity", ""},
+			{"add", "/spec/holderIdentity", string(nodeName)},
+		})
+		if err != nil {
+			return err
+		}
+
+		if err := c.Patch(
+			ctx,
+			&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{
+				Name:      string(nodeName),
+				Namespace: corev1.NamespaceNodeLease,
+			}},
+			client.RawPatch(types.JSONPatchType, patch),
+		); err != nil && !apierrors.IsInvalid(err) {
+			return fmt.Errorf("failed to ensure that a holder identity is set: %w", err)
+		}
+	}
+
+	if err := registerSignalController(logger, mgr, signalControllerEventFilter(nodeName, apsigpred.DefaultErrorHandler(logger, "k0s signal")), delegate, clusterID, k0sVersionHandler); err != nil {
+		return fmt.Errorf("unable to register signal controller: %w", err)
+	}
+
+	if err := registerDownloading(logger, mgr, downloadEventFilter(nodeName, apsigpred.DefaultErrorHandler(logger, "k0s downloading")), delegate, k0sBinaryDir); err != nil {
+		return fmt.Errorf("unable to register downloading controller: %w", err)
+	}
+
+	// TODO: Refactor this in v1.37+ so that the (un-)cordoning controllers only
+	// get added for leaders.
+	var nodeDelegate apdel.ControllerDelegate
+	if _, isController := delegate.CreateObject().(*autopilotv1beta2.ControlNode); isController {
+		nodeDelegate = apdel.NodeControllerDelegate()
+	}
+
+	cordoningEventFilter := cordoningEventFilter(apsigpred.DefaultErrorHandler(logger, "k0s cordoning"))
+	if leaseStatus != leaderelection.StatusLeading {
+		cordoningEventFilter = crpred.And(apsigpred.SignalNamePredicate(nodeName), cordoningEventFilter)
+	}
+
+	if err := registerCordoning(logger, mgr, cordoningEventFilter, delegate, nodeName, leaseStatus); err != nil {
+		return fmt.Errorf("unable to register cordoning controller: %w", err)
+	}
+
+	if nodeDelegate != nil {
+		if err := registerCordoning(logger, mgr, cordoningEventFilter, nodeDelegate, nodeName, leaseStatus); err != nil {
+			return fmt.Errorf("unable to register cordoning node controller: %w", err)
+		}
+	}
+
+	if err := registerApplyingUpdate(logger, mgr, applyingUpdateEventFilter(nodeName, apsigpred.DefaultErrorHandler(logger, "k0s applying-update")), delegate, k0sBinaryDir, restartTracker.RestartInitiated); err != nil {
+		return fmt.Errorf("unable to register applying-update controller: %w", err)
+	}
+
+	if err := registerRestart(logger, mgr, restartEventFilter(nodeName, apsigpred.DefaultErrorHandler(logger, "k0s restart")), delegate, restartTracker.IsRestartPending); err != nil {
+		return fmt.Errorf("unable to register restart controller: %w", err)
+	}
+
+	if err := registerRestarted(logger, mgr, restartedEventFilter(nodeName, apsigpred.DefaultErrorHandler(logger, "k0s restarted")), delegate, restartTracker.IsRestartPending); err != nil {
+		return fmt.Errorf("unable to register restarted controller: %w", err)
+	}
+
+	unCordoningEventFilter := unCordoningEventFilter(apsigpred.DefaultErrorHandler(logger, "k0s uncordoning"))
+	if leaseStatus != leaderelection.StatusLeading {
+		unCordoningEventFilter = crpred.And(apsigpred.SignalNamePredicate(nodeName), unCordoningEventFilter)
+	}
+
+	if err := registerUncordoning(logger, mgr, unCordoningEventFilter, delegate, nodeName, leaseStatus); err != nil {
+		return fmt.Errorf("unable to register uncordoning controller: %w", err)
+	}
+
+	if nodeDelegate != nil {
+		if err := registerUncordoning(logger, mgr, unCordoningEventFilter, nodeDelegate, nodeName, leaseStatus); err != nil {
+			return fmt.Errorf("unable to register uncordoning node controller: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// getK0sVersion returns the version k0s installed, as identified by the
+// provided status socket path.
+func getK0sVersion(statusSocketPath string) (string, error) {
+	status, err := status.GetStatusInfo(statusSocketPath)
+	if err != nil {
+		return "", err
+	}
+
+	return status.Version, nil
+}

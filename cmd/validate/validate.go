@@ -1,56 +1,30 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2025 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package validate
 
 import (
-	"fmt"
+	configcmd "github.com/k0sproject/k0s/cmd/config"
 
-	"github.com/k0sproject/k0s/pkg/config"
 	"github.com/spf13/cobra"
 )
 
-type CmdOpts config.CLIOptions
-
+// TODO deprecated, remove when appropriate
 func NewValidateCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "validate",
-		Short: "Helper command for validating the config file",
+		Use:        "validate",
+		Short:      "Validation related sub-commands",
+		Hidden:     true,
+		Deprecated: "use 'k0s config validate' instead",
 	}
-	cmd.AddCommand(validateConfigCmd())
-	cmd.SilenceUsage = true
+	cmd.AddCommand(newConfigCmd())
 	return cmd
 }
 
-func validateConfigCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "config",
-		Short: "Helper command for validating the config file",
-		Long: `Example:
-   k0s validate config --config path_to_config.yaml`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			c := CmdOpts(config.GetCmdOpts())
-			_, err := config.GetYamlFromFile(c.CfgFile, c.K0sVars)
-			if err != nil {
-				fmt.Println(err)
-			}
-			return nil
-		},
-	}
-
-	// append flags
-	cmd.PersistentFlags().AddFlagSet(config.GetPersistentFlagSet())
+func newConfigCmd() *cobra.Command {
+	cmd := configcmd.NewValidateCmd()
+	cmd.Use = "config"
+	cmd.Deprecated = "use 'k0s config validate' instead"
+	cmd.Hidden = false
 	return cmd
 }

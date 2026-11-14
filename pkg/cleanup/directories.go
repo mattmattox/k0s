@@ -1,36 +1,25 @@
+//go:build linux
+
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
+
 package cleanup
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/sirupsen/logrus"
 	"k8s.io/mount-utils"
 )
 
-type directories struct {
-	Config *Config
-}
-
-// Name returns the name of the step
-func (d *directories) Name() string {
-	return "remove directories step"
-}
-
-// NeedsToRun checks if dataDir and runDir are present on the host
-func (d *directories) NeedsToRun() bool {
-	if _, err := os.Stat(d.Config.dataDir); err == nil {
-		return true
-	}
-	if _, err := os.Stat(d.Config.runDir); err == nil {
-		return true
-	}
-	return false
-}
-
 // Run removes all kubelet mounts and deletes generated dataDir and runDir
-func (d *directories) Run() error {
+func (d *directories) Run(context.Context) error {
 	// unmount any leftover overlays (such as in alpine)
 	mounter := mount.New("")
 	procMounts, err := mounter.List()
@@ -38,30 +27,105 @@ func (d *directories) Run() error {
 		return err
 	}
 
-	// search and unmount kubelet volume mounts
-	for _, v := range procMounts {
-		if strings.Compare(v.Path, fmt.Sprintf("%s/kubelet", d.Config.dataDir)) == 0 {
+	var dataDirMounted, kubeletRootDirMounted bool
+
+	// The kubelet root dir only needs special handling when it lives outside
+	// the data dir. When it's under the data dir (the default location), it
+	// gets cleaned up together with the data dir below, so we must let its
+	// own mount be unmounted here just like any other mount under the data
+	// dir; otherwise the data dir cleanup would choke on the busy mount.
+	kubeletRootDirSeparate := !isUnderPath(d.kubeletRootDir, d.dataDir)
+
+	// ensure that we don't delete any persistent data volumes that may be
+	// mounted by kubernetes by unmount every mount point under DataDir.
+	//
+	// Unmount in the reverse order it was mounted so we handle recursive
+	// bind mounts and over mounts properly. If we for any reason are not
+	// able to unmount, fall back to lazy unmount and if that also fails
+	// bail out and don't delete anything.
+	//
+	// Note that if there are any shared bind mounts under k0s data
+	// directory, we may end up unmounting stuff outside the k0s DataDir.
+	// If someone has set a bind mount to be shared, we assume that is the
+	// desired behavior. See MS_SHARED and NOTES:
+	//  - https://man7.org/linux/man-pages/man2/mount.2.html
+	//  - https://man7.org/linux/man-pages/man2/umount.2.html#NOTES
+	for _, v := range slices.Backward(procMounts) {
+		// avoid unmounting the data dir or a separate kubelet root dir
+		// themselves if they are mounted on a separate partition/volume:
+		// k0s didn't mount them, so leave them alone and just empty their
+		// contents.
+		if v.Path == d.dataDir {
+			dataDirMounted = true
+			continue
+		}
+		if v.Path == d.kubeletRootDir && kubeletRootDirSeparate {
+			kubeletRootDirMounted = true
+			continue
+		}
+		if isUnderPath(v.Path, d.kubeletRootDir) || isUnderPath(v.Path, d.dataDir) {
 			logrus.Debugf("%v is mounted! attempting to unmount...", v.Path)
 			if err = mounter.Unmount(v.Path); err != nil {
-				logrus.Warningf("failed to unmount %v", v.Path)
-			}
-		} else if strings.Compare(v.Path, d.Config.dataDir) == 0 {
-			logrus.Debugf("%v is mounted! attempting to unmount...", v.Path)
-			if err = mounter.Unmount(v.Path); err != nil {
-				logrus.Warningf("failed to unmount %v", v.Path)
+				// if we fail to unmount, try lazy unmount so
+				// we don't end up deleting stuff that we
+				// shouldn't
+				logrus.Warningf("lazy unmounting %v", v.Path)
+				if err = UnmountLazy(v.Path); err != nil {
+					return fmt.Errorf("failed unmount %v", v.Path)
+				}
 			}
 		}
 	}
 
-	logrus.Debugf("deleting k0s generated data-dir (%v) and run-dir (%v)", d.Config.dataDir, d.Config.runDir)
-	if err := os.RemoveAll(d.Config.dataDir); err != nil {
-		fmtError := fmt.Errorf("failed to delete %v. err: %v", d.Config.dataDir, err)
-		return fmtError
+	logrus.Debugf("removing kubelet root dir (%s)", d.kubeletRootDir)
+	if err := os.RemoveAll(d.kubeletRootDir); err != nil {
+		// if the kubelet root dir is itself a mount point (e.g. mounted on
+		// a separate volume), it can't be removed; emptying its contents is
+		// enough. Bail out only on other errors.
+		if !kubeletRootDirMounted {
+			return fmt.Errorf("failed to delete k0s kubelet root directory: %w", err)
+		}
+		if !errorIsUnlinkat(err, d.kubeletRootDir) {
+			return fmt.Errorf("failed to delete contents of mounted kubelet root directory: %w", err)
+		}
 	}
-	if err := os.RemoveAll(d.Config.runDir); err != nil {
-		fmtError := fmt.Errorf("failed to delete %v. err: %v", d.Config.runDir, err)
-		return fmtError
+
+	if dataDirMounted {
+		logrus.Debugf("removing the contents of mounted data-dir (%s)", d.dataDir)
+	} else {
+		logrus.Debugf("removing k0s generated data-dir (%s)", d.dataDir)
+	}
+
+	if err := os.RemoveAll(d.dataDir); err != nil {
+		if !dataDirMounted {
+			return fmt.Errorf("failed to delete k0s generated data-dir: %w", err)
+		}
+		if !errorIsUnlinkat(err, d.dataDir) {
+			return fmt.Errorf("failed to delete contents of mounted data-dir: %w", err)
+		}
+	}
+
+	logrus.Debugf("deleting k0s generated run-dir (%s)", d.runDir)
+	if err := os.RemoveAll(d.runDir); err != nil {
+		return fmt.Errorf("failed to delete %s: %w", d.runDir, err)
 	}
 
 	return nil
+}
+
+// test if the path is a directory equal to or under base
+func isUnderPath(path, base string) bool {
+	rel, err := filepath.Rel(base, path)
+	return err == nil && !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel)
+}
+
+// this is for checking if the error returned by os.RemoveAll is due to
+// it being a mount point. if it is, we can ignore the error. this way
+// we can't rely on os.RemoveAll instead of recursively deleting the
+// contents of the directory
+func errorIsUnlinkat(err error, dir string) bool {
+	if pathErr, ok := errors.AsType[*os.PathError](err); ok {
+		return pathErr.Path == dir && pathErr.Op == "unlinkat"
+	}
+	return false
 }

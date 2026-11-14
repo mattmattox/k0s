@@ -1,41 +1,61 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"os/signal"
+	"path/filepath"
 	"runtime"
-	"syscall"
+
+	"github.com/k0sproject/k0s/cmd/internal"
+	"github.com/k0sproject/k0s/internal/pkg/dir"
+	"github.com/k0sproject/k0s/internal/pkg/file"
+	"github.com/k0sproject/k0s/internal/pkg/flags"
+	"github.com/k0sproject/k0s/internal/pkg/stringmap"
+	"github.com/k0sproject/k0s/internal/pkg/sysinfo"
+	"github.com/k0sproject/k0s/internal/supervised"
+	"github.com/k0sproject/k0s/pkg/build"
+	"github.com/k0sproject/k0s/pkg/component/iptables"
+	"github.com/k0sproject/k0s/pkg/component/manager"
+	"github.com/k0sproject/k0s/pkg/component/prober"
+	"github.com/k0sproject/k0s/pkg/component/status"
+	"github.com/k0sproject/k0s/pkg/component/worker"
+	workerconfig "github.com/k0sproject/k0s/pkg/component/worker/config"
+	"github.com/k0sproject/k0s/pkg/component/worker/containerd"
+	"github.com/k0sproject/k0s/pkg/component/worker/nllb"
+	"github.com/k0sproject/k0s/pkg/config"
+	"github.com/k0sproject/k0s/pkg/constant"
+	"github.com/k0sproject/k0s/pkg/kubernetes"
+	"github.com/k0sproject/k0s/pkg/node"
+	"github.com/k0sproject/k0s/pkg/token"
+
+	apitypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-
-	"github.com/k0sproject/k0s/internal/util"
-	"github.com/k0sproject/k0s/pkg/component"
-	"github.com/k0sproject/k0s/pkg/component/worker"
-	"github.com/k0sproject/k0s/pkg/config"
 )
 
-type CmdOpts config.CLIOptions
+type Command config.CLIOptions
+
+// Interface between an embedded worker and its embedding controller.
+type EmbeddingController interface {
+	IsSingleNode() bool
+	UsesIPTables() bool
+	SetWorkerClientFactory(kubernetes.ClientFactoryInterface)
+}
 
 func NewWorkerCmd() *cobra.Command {
+	var (
+		debugFlags internal.DebugFlags
+	)
+
 	cmd := &cobra.Command{
 		Use:   "worker [join-token]",
 		Short: "Run worker",
@@ -45,139 +65,314 @@ func NewWorkerCmd() *cobra.Command {
 
 	or CLI flag:
 	$ k0s worker --token-file [path_to_file]
-	Note: Token can be passed either as a CLI argument or as a flag`,
+
+	or environment variable:
+	$ K0S_TOKEN=[token] k0s worker
+	Note: Token can be passed either as a CLI argument, a flag, or an environment variable`,
+		Args:             cobra.MaximumNArgs(1),
+		PersistentPreRun: debugFlags.Run,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c := CmdOpts(config.GetCmdOpts())
+			opts, err := config.GetCmdOpts(cmd)
+			if err != nil {
+				return err
+			}
+
+			ctx := cmd.Context()
+			if err := initLogging(ctx, opts.K0sVars.DataDir); err != nil {
+				return fmt.Errorf("failed to initialize logging: %w", err)
+			}
+
+			c := (*Command)(opts)
 			if len(args) > 0 {
 				c.TokenArg = args[0]
 			}
-
-			c.Logging = util.MapMerge(c.CmdLogLevels, c.DefaultLogLevels)
-			if len(c.TokenArg) > 0 && len(c.TokenFile) > 0 {
-				return fmt.Errorf("you can only pass one token argument either as a CLI argument 'k0s worker [token]' or as a flag 'k0s worker --token-file [path]'")
+			if err := internal.CheckSingleTokenSource(c.TokenArg, c.TokenFile); err != nil {
+				return err
 			}
 
-			if len(c.TokenFile) > 0 {
-				bytes, err := ioutil.ReadFile(c.TokenFile)
-				if err != nil {
-					return err
+			getBootstrapKubeconfig := kubeconfigGetterFromJoinToken(c.TokenFile, c.TokenArg)
+
+			nodeName, kubeletExtraArgs, err := GetNodeName(&c.WorkerOptions)
+			if err != nil {
+				return fmt.Errorf("failed to determine node name: %w", err)
+			}
+
+			if err := (&sysinfo.K0sSysinfoSpec{
+				ControllerRoleEnabled: false,
+				WorkerRoleEnabled:     true,
+				DataDir:               c.K0sVars.DataDir,
+			}).RunPreFlightChecks(opts.IgnorePreFlightChecks); !opts.IgnorePreFlightChecks && err != nil {
+				return err
+			}
+
+			// Check for legacy CA file (unused on worker-only nodes since 1.33)
+			if legacyCAFile := filepath.Join(c.K0sVars.CertRootDir, "ca.crt"); file.Exists(legacyCAFile) {
+				// Keep the file to allow interop between 1.32 and 1.33.
+				// TODO automatically delete this file in future releases.
+				logrus.Infof("The file %s is no longer used and can safely be deleted", legacyCAFile)
+			}
+
+			// create directories early with the proper permissions
+			if err := dir.Init(c.K0sVars.DataDir, constant.DataDirMode); err != nil {
+				return err
+			}
+			if err := dir.Init(c.K0sVars.RunDir, constant.RunDirMode); err != nil {
+				return err
+			}
+			if err := dir.Init(c.K0sVars.BinDir, constant.BinDirMode); err != nil {
+				return err
+			}
+
+			rtc, err := config.NewRuntimeConfig(c.K0sVars, nil)
+			if err != nil {
+				return fmt.Errorf("failed to initialize runtime config: %w", err)
+			}
+			defer func() {
+				if err := rtc.Spec.Cleanup(); err != nil {
+					logrus.WithError(err).Warn("Failed to cleanup runtime config")
 				}
-				c.TokenArg = string(bytes)
-			}
-			cmd.SilenceUsage = true
-			return c.StartWorker()
+			}()
+
+			return c.Start(ctx, nodeName, kubeletExtraArgs, getBootstrapKubeconfig, nil)
 		},
 	}
 
-	// append flags
-	cmd.PersistentFlags().AddFlagSet(config.GetPersistentFlagSet())
-	cmd.PersistentFlags().AddFlagSet(config.GetWorkerFlags())
+	debugFlags.LongRunning().AddToFlagSet(cmd.PersistentFlags())
+
+	flags := cmd.Flags()
+	flags.AddFlagSet(config.GetPersistentFlagSet())
+	flags.AddFlagSet(config.GetWorkerFlags())
+
 	return cmd
 }
 
-// StartWorker starts the worker components based on the CmdOpts config
-func (c *CmdOpts) StartWorker() error {
+func GetNodeName(opts *config.WorkerOptions) (apitypes.NodeName, stringmap.StringMap, error) {
+	// The node name used during bootstrapping needs to match the node name
+	// selected by kubelet. Otherwise, kubelet will have problems interacting
+	// with a Node object that doesn't match the name in the certificates.
+	// https://kubernetes.io/docs/reference/access-authn-authz/node/
 
-	worker.KernelSetup()
-	if c.TokenArg == "" && !util.FileExists(c.K0sVars.KubeletAuthConfigPath) {
-		return fmt.Errorf("normal kubelet kubeconfig does not exist and no join-token given. dunno how to make kubelet auth to api")
+	// Kubelet still has some deprecated support for cloud providers, which may
+	// completely bypass the "standard" node name detection as it's done here.
+	// K0s only supports external cloud providers, which seems to be a dead code
+	// path anyways in kubelet. So it's safe to assume that the following code
+	// exactly matches the behavior of kubelet.
+
+	kubeletExtraArgs := flags.Split(opts.KubeletExtraArgs)
+	nodeName, err := node.GetNodeName(kubeletExtraArgs["--hostname-override"])
+	if err != nil {
+		return "", nil, err
 	}
+	return nodeName, kubeletExtraArgs, nil
+}
 
-	// Dump join token into kubelet-bootstrap kubeconfig if it does not already exist
-	if c.TokenArg != "" && !util.FileExists(c.K0sVars.KubeletBootstrapConfigPath) {
-		if err := worker.HandleKubeletBootstrapToken(c.TokenArg, c.K0sVars); err != nil {
-			return err
+func kubeconfigGetterFromJoinToken(tokenFile, tokenArg string) clientcmd.KubeconfigGetter {
+	if tokenArg != "" {
+		return func() (*clientcmdapi.Config, error) {
+			return loadKubeconfigFromJoinToken(tokenArg)
 		}
 	}
 
-	kubeletConfigClient, err := worker.LoadKubeletConfigClient(c.K0sVars)
+	if envToken := os.Getenv(internal.EnvVarToken); envToken != "" {
+		return func() (*clientcmdapi.Config, error) {
+			return loadKubeconfigFromJoinToken(envToken)
+		}
+	}
+
+	if tokenFile == "" {
+		return nil
+	}
+
+	return func() (*clientcmdapi.Config, error) {
+		tokenData, err := internal.GetTokenData("", tokenFile)
+		if err != nil {
+			return nil, err
+		}
+
+		return loadKubeconfigFromJoinToken(tokenData)
+	}
+}
+
+func loadKubeconfigFromJoinToken(tokenData string) (*clientcmdapi.Config, error) {
+	decoded, err := token.DecodeJoinToken(tokenData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode join token: %w", err)
+	}
+
+	kubeconfig, err := clientcmd.Load(decoded)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load kubeconfig from join token: %w", err)
+	}
+
+	if tokenType := token.GetTokenType(kubeconfig); tokenType != "kubelet-bootstrap" {
+		return nil, fmt.Errorf("wrong token type %s, expected type: kubelet-bootstrap", tokenType)
+	}
+
+	return kubeconfig, nil
+}
+
+// Start starts the worker components based on the given [config.CLIOptions].
+func (c *Command) Start(ctx context.Context, nodeName apitypes.NodeName, kubeletExtraArgs stringmap.StringMap, getBootstrapKubeconfig clientcmd.KubeconfigGetter, controller EmbeddingController) error {
+	if err := worker.BootstrapKubeletClientConfig(ctx, c.K0sVars, nodeName, &c.WorkerOptions, getBootstrapKubeconfig); err != nil {
+		return fmt.Errorf("failed to bootstrap kubelet client configuration: %w", err)
+	}
+
+	kubeletKubeconfigPath := c.K0sVars.KubeletAuthConfigPath
+
+	// When upgrading controller+worker nodes in a multi-node cluster with a load balancer, the API
+	// server address needs to be overridden to point to the local API server. This is needed so
+	// that the kubelet will not connect to an API server that is running a previous version of
+	// k0s which would violate the Kubernetes version skew policy.
+	if controller != nil {
+		directKubeconfigPath, err := worker.CreateDirectKubeletKubeconfig(ctx, c.K0sVars, nodeName)
+		if err != nil {
+			return fmt.Errorf("failed to create direct kubelet kubeconfig: %w", err)
+		}
+		kubeletKubeconfigPath = directKubeconfigPath
+	}
+
+	workerConfig, err := workerconfig.LoadProfile(
+		ctx,
+		kubernetes.KubeconfigFromFile(kubeletKubeconfigPath),
+		c.K0sVars.DataDir,
+		c.WorkerProfile,
+	)
 	if err != nil {
 		return err
 	}
 
-	componentManager := component.NewManager()
-	if runtime.GOOS == "windows" && c.CriSocket == "" {
-		return fmt.Errorf("windows worker needs to have external CRI")
-	}
-	if c.CriSocket == "" {
-		componentManager.Add(&worker.ContainerD{
-			LogLevel: c.Logging["containerd"],
-			K0sVars:  c.K0sVars,
-		})
-	}
+	componentManager := manager.New(prober.DefaultProber)
 
-	componentManager.Add(worker.NewOCIBundleReconciler(c.K0sVars))
-	if c.WorkerProfile == "default" && runtime.GOOS == "windows" {
-		c.WorkerProfile = "default-windows"
-	}
+	var staticPods worker.StaticPods
 
-	componentManager.Add(&worker.Kubelet{
-		CRISocket:           c.CriSocket,
-		EnableCloudProvider: c.CloudProvider,
-		K0sVars:             c.K0sVars,
-		KubeletConfigClient: kubeletConfigClient,
-		LogLevel:            c.Logging["kubelet"],
-		Profile:             c.WorkerProfile,
-		Labels:              c.Labels,
-		ExtraArgs:           c.KubeletExtraArgs,
-	})
-
-	if runtime.GOOS == "windows" {
-		if c.TokenArg == "" {
-			return fmt.Errorf("no join-token given, which is required for windows bootstrap")
+	if workerConfig.NodeLocalLoadBalancing.IsEnabled() {
+		if controller != nil && controller.IsSingleNode() {
+			return errors.New("node-local load balancing cannot be used in a single-node cluster")
 		}
-		componentManager.Add(&worker.KubeProxy{
-			K0sVars:   c.K0sVars,
-			LogLevel:  c.Logging["kube-proxy"],
-			CIDRRange: c.CIDRRange,
+
+		sp := worker.NewStaticPods()
+		reconciler, err := nllb.NewReconciler(c.K0sVars, sp, c.WorkerProfile, *workerConfig.DeepCopy(), nodeName)
+		if err != nil {
+			return fmt.Errorf("failed to create node-local load balancer reconciler: %w", err)
+		}
+		// If this is a worker only node, the kubelet should use the NLLB kubelet kubeconfig path
+		// rather than the direct kubelet kubeconfig path in the controller+worker mode.
+		if controller == nil {
+			kubeletKubeconfigPath = reconciler.GetKubeletKubeconfigPath()
+		}
+		staticPods = sp
+
+		componentManager.Add(ctx, sp)
+		componentManager.Add(ctx, reconciler)
+	}
+
+	clientFactory := &kubernetes.ClientFactory{LoadRESTConfig: func() (*rest.Config, error) {
+		return kubernetes.ClientConfig(kubernetes.KubeconfigFromFile(kubeletKubeconfigPath))
+	}}
+	if controller != nil {
+		controller.SetWorkerClientFactory(clientFactory)
+	}
+
+	if c.CriSocket == "" {
+		componentManager.Add(ctx, containerd.NewComponent(c.LogLevels.Containerd, c.K0sVars, workerConfig))
+		componentManager.Add(ctx, worker.NewOCIBundleReconciler(c.K0sVars))
+		componentManager.Add(ctx, containerd.NewDeprecationMonitor(
+			containerd.Address(c.K0sVars.RunDir),
+			clientFactory,
+			nodeName,
+		))
+	}
+
+	if runtime.GOOS == "linux" && (controller == nil || !controller.UsesIPTables()) {
+		componentManager.Add(ctx, &iptables.Component{
+			IPTablesMode: c.IPTablesMode,
+			BinDir:       c.K0sVars.BinDir,
 		})
-		componentManager.Add(&worker.CalicoInstaller{
-			Token:      c.TokenArg,
-			APIAddress: c.APIServer,
-			CIDRRange:  c.CIDRRange,
-			ClusterDNS: c.ClusterDNS,
+	}
+	componentManager.Add(ctx,
+		&worker.Kubelet{
+			NodeName:             nodeName,
+			CRISocket:            c.CriSocket,
+			EnableCloudProvider:  c.CloudProvider,
+			K0sVars:              c.K0sVars,
+			StaticPods:           staticPods,
+			Kubeconfig:           kubeletKubeconfigPath,
+			Configuration:        *workerConfig.KubeletConfiguration.DeepCopy(),
+			LogLevel:             c.LogLevels.Kubelet,
+			Labels:               c.Labels,
+			Taints:               c.Taints,
+			ExtraArgs:            kubeletExtraArgs,
+			DualStackEnabled:     workerConfig.DualStackEnabled,
+			PrimaryAddressFamily: workerConfig.PrimaryAddressFamily,
+		})
+
+	(&platformSpecificComponents{
+		k0sVars:       c.K0sVars,
+		nodeName:      nodeName,
+		workerConfig:  workerConfig,
+		controller:    controller,
+		clientFactory: clientFactory,
+	}).addTo(ctx, componentManager)
+
+	if controller == nil {
+		// if running inside a controller, status component is already running
+		componentManager.Add(ctx, &status.Status{
+			Prober: prober.DefaultProber,
+			StatusInformation: status.K0sStatus{
+				Pid:        os.Getpid(),
+				Role:       "worker",
+				Args:       os.Args,
+				Version:    build.Version,
+				Workloads:  true,
+				SingleNode: false,
+				K0sVars:    c.K0sVars,
+				// worker does not have cluster config. this is only shown in "k0s status -o json".
+				// todo: if it's needed, a worker side config client can be set up and used to load the config
+				ClusterConfig: nil,
+			},
+			GetWorkerClientFactory: func() kubernetes.ClientFactoryInterface { return clientFactory },
+			Socket:                 c.K0sVars.StatusSocketPath,
 		})
 	}
 
 	// extract needed components
-	if err := componentManager.Init(); err != nil {
+	if err := componentManager.Init(ctx); err != nil {
 		return err
 	}
 
 	worker.KernelSetup()
 
-	// Set up signal handling. Use buffered channel so we dont miss
-	// signals during startup
-	ctx, cancel := context.WithCancel(context.Background())
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-	defer func() {
-		signal.Stop(ch)
-		cancel()
-	}()
-
-	go func() {
-		select {
-		case <-ch:
-			logrus.Info("Shutting down k0s worker")
-			cancel()
-		case <-ctx.Done():
-			logrus.Debug("Context done in go-routine")
-		}
-	}()
-
 	err = componentManager.Start(ctx)
 	if err != nil {
-		logrus.WithError(err).Error("failed to start some of the worker components")
-		ch <- syscall.SIGTERM
+		return fmt.Errorf("failed to start worker components: %w", err)
 	}
+
+	if supervised := supervised.Get(ctx); supervised != nil {
+		supervised.MarkReady()
+	}
+
 	// Wait for k0s process termination
+	if controller != nil {
+		logrus.Info("Controller has started")
+	} else {
+		logrus.Info("Worker has started")
+	}
 	<-ctx.Done()
-	logrus.Info("Shutting down k0s worker")
+	logrus.Info("Shutting down k0s: ", context.Cause(ctx))
 
 	// Stop components
 	if err := componentManager.Stop(); err != nil {
-		logrus.WithError(err).Error("error while stoping component manager")
+		logrus.WithError(err).Error("Failed to stop worker components")
+	} else {
+		logrus.Info("All worker components stopped")
 	}
 	return nil
+}
+
+type platformSpecificComponents struct {
+	k0sVars       *config.CfgVars
+	nodeName      apitypes.NodeName
+	workerConfig  *workerconfig.Profile
+	controller    EmbeddingController
+	clientFactory kubernetes.ClientFactoryInterface
 }

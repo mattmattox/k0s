@@ -1,101 +1,231 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package controller
 
 import (
 	"bytes"
+	"context"
+	"fmt"
+	"path/filepath"
+	"reflect"
+	"strconv"
 
-	"github.com/k0sproject/k0s/internal/util"
-	config "github.com/k0sproject/k0s/pkg/apis/v1beta1"
-	"github.com/pkg/errors"
+	"github.com/k0sproject/k0s/internal/pkg/dir"
+	"github.com/k0sproject/k0s/internal/pkg/file"
+	"github.com/k0sproject/k0s/internal/pkg/stringmap"
+	"github.com/k0sproject/k0s/internal/pkg/templatewriter"
+	"github.com/k0sproject/k0s/pkg/apis/k0s/v1beta1"
+	"github.com/k0sproject/k0s/pkg/component/manager"
+	"github.com/k0sproject/k0s/pkg/component/worker/nllb"
+	"github.com/k0sproject/k0s/pkg/config"
+	"github.com/k0sproject/k0s/pkg/constant"
+
 	"github.com/sirupsen/logrus"
 )
 
 // KubeRouter implements the kube-router reconciler component
 type KubeRouter struct {
-	clusterConf *config.ClusterConfig
-	log         *logrus.Entry
+	log logrus.FieldLogger
 
-	saver manifestsSaver
+	k0sVars              *config.CfgVars
+	apiServerAddress     string
+	primaryAddressFamily v1beta1.PrimaryAddressFamilyType
+	serviceCIDRs         string
+	singleStackIPv6      bool
+
+	previousConfig  kubeRouterConfig
+	previousPatches v1beta1.Patches
 }
+
+var _ manager.Component = (*KubeRouter)(nil)
+var _ manager.Reconciler = (*KubeRouter)(nil)
 
 type kubeRouterConfig struct {
 	MTU               int
 	AutoMTU           bool
+	MetricsPort       int
 	CNIInstallerImage string
 	CNIImage          string
+	CNIHairpin        bool
+	IPMasq            bool
 	PeerRouterIPs     string
 	PeerRouterASNs    string
 	PullPolicy        string
+	Args              []string
 }
 
 // NewKubeRouter creates new KubeRouter reconciler component
-func NewKubeRouter(clusterConf *config.ClusterConfig, manifestsSaver manifestsSaver) (*KubeRouter, error) {
-	log := logrus.WithFields(logrus.Fields{"component": "kube-router"})
+func NewKubeRouter(k0sVars *config.CfgVars, apiServerAddress string, primaryAddressFamily v1beta1.PrimaryAddressFamilyType, serviceCIDRs string, singleStackIPv6 bool) *KubeRouter {
 	return &KubeRouter{
-		clusterConf: clusterConf,
-		saver:       manifestsSaver,
-		log:         log,
-	}, nil
+		log: logrus.WithFields(logrus.Fields{"component": "kube-router"}),
+
+		k0sVars:              k0sVars,
+		apiServerAddress:     apiServerAddress,
+		primaryAddressFamily: primaryAddressFamily,
+		serviceCIDRs:         serviceCIDRs,
+		singleStackIPv6:      singleStackIPv6,
+	}
 }
 
-// Init does nothing
-func (c *KubeRouter) Init() error { return nil }
-
-// Healthy is a no-op check
-func (c *KubeRouter) Healthy() error { return nil }
+// Init implements [manager.Component].
+func (k *KubeRouter) Init(context.Context) error {
+	return nil
+}
 
 // Stop no-op as nothing running
-func (c *KubeRouter) Stop() error { return nil }
+func (k *KubeRouter) Stop() error { return nil }
 
-// Run runs the kube-router reconciler
-func (c *KubeRouter) Run() error {
-	c.log.Info("starting to dump manifests")
+func getHairpinConfig(krc *v1beta1.KubeRouter) (cniHairpin bool, globalHairpin bool) {
+	// Configure hairpin
+	switch krc.Hairpin {
+	case v1beta1.HairpinUndefined:
+		// If Hairpin is undefined, then we honor HairpinMode
+		if krc.HairpinMode {
+			cniHairpin = true
+			globalHairpin = true
+		}
+	case v1beta1.HairpinDisabled:
+		cniHairpin = false
+		globalHairpin = false
+	case v1beta1.HairpinAllowed:
+		cniHairpin = true
+		globalHairpin = false
+	case v1beta1.HairpinEnabled:
+		cniHairpin = true
+		globalHairpin = true
+	}
+	return
+}
+
+func (k *KubeRouter) apiServerAddressFor(clusterConfig *v1beta1.ClusterConfig) string {
+	address := k.apiServerAddress
+	if nllbURL, err := nllb.APIServerURL(clusterConfig.Spec.Network.NodeLocalLoadBalancing); err != nil {
+		k.log.WithError(err).Warn("Using cluster-wide API server address: ", address)
+	} else if nllbURL != nil {
+		// FIXME: Transitions from non-node-local load balanced to node-local
+		// load balanced setups will be problematic: The controller will update
+		// the DaemonSet with localhost, but the worker nodes won't reconcile
+		// their state (yet) and need to be restarted manually in order to start
+		// their load balancer. Transitions in the other direction suffer from
+		// the same limitation, but that will be less grave, as the node-local
+		// load balancers will remain operational until the next node restart
+		// and the proxy will stay connected.
+		address = nllbURL.String()
+		k.log.Debug("Using node-local load balanced API server URL: ", address)
+	}
+	return address
+}
+
+// Reconcile detects changes in configuration and applies them to the component
+func (k *KubeRouter) Reconcile(_ context.Context, clusterConfig *v1beta1.ClusterConfig) error {
+	logrus.Debug("reconcile method called for: KubeRouter")
+	if clusterConfig.Spec.Network.Provider != constant.CNIProviderKubeRouter {
+		return nil
+	}
+
+	existingCNI := existingCNIProvider(k.k0sVars.ManifestsDir)
+	if existingCNI != "" && existingCNI != constant.CNIProviderKubeRouter {
+		return fmt.Errorf("cannot change CNI provider from %s to %s", existingCNI, constant.CNIProviderKubeRouter)
+	}
+
+	cniHairpin, globalHairpin := getHairpinConfig(clusterConfig.Spec.Network.KubeRouter)
+	var enableIPv4, enableIPv6 bool
+	if clusterConfig.Spec.Network.DualStack.Enabled {
+		enableIPv4, enableIPv6 = true, true
+	} else if k.singleStackIPv6 {
+		enableIPv6 = true
+	} else {
+		enableIPv4 = true
+	}
+
+	args := stringmap.StringMap{
+		// k0s set default args
+		"run-router":           "true",
+		"run-firewall":         "true",
+		"run-service-proxy":    "false",
+		"bgp-graceful-restart": "true",
+		// Args from config values
+		"enable-ipv4":              strconv.FormatBool(enableIPv4),
+		"enable-ipv6":              strconv.FormatBool(enableIPv6),
+		"auto-mtu":                 strconv.FormatBool(clusterConfig.Spec.Network.KubeRouter.IsAutoMTU()),
+		"metrics-port":             strconv.Itoa(clusterConfig.Spec.Network.KubeRouter.MetricsPort),
+		"hairpin-mode":             strconv.FormatBool(globalHairpin),
+		"service-cluster-ip-range": k.serviceCIDRs,
+		// Dial the API directly. kube-router must not depend on in-cluster
+		// networking already being functional.
+		"master": k.apiServerAddressFor(clusterConfig),
+	}
+
+	// IPv6 requires a router ID, instead of generating one ourselves, rely on kube-router logic
+	if k.primaryAddressFamily == v1beta1.PrimaryFamilyIPv6 {
+		args["router-id"] = "generate"
+	}
+
+	// We should not add peering flags if the values are empty
+	if clusterConfig.Spec.Network.KubeRouter.PeerRouterASNs != "" {
+		args["peer-router-asns"] = clusterConfig.Spec.Network.KubeRouter.PeerRouterASNs
+	}
+	if clusterConfig.Spec.Network.KubeRouter.PeerRouterIPs != "" {
+		args["peer-router-ips"] = clusterConfig.Spec.Network.KubeRouter.PeerRouterIPs
+	}
+
+	// Override or add args from config
+	args.Merge(clusterConfig.Spec.Network.KubeRouter.ExtraArgs)
 
 	cfg := kubeRouterConfig{
-		AutoMTU:           c.clusterConf.Spec.Network.KubeRouter.AutoMTU,
-		MTU:               c.clusterConf.Spec.Network.KubeRouter.MTU,
-		PeerRouterIPs:     c.clusterConf.Spec.Network.KubeRouter.PeerRouterIPs,
-		PeerRouterASNs:    c.clusterConf.Spec.Network.KubeRouter.PeerRouterASNs,
-		CNIImage:          c.clusterConf.Spec.Images.KubeRouter.CNI.URI(),
-		CNIInstallerImage: c.clusterConf.Spec.Images.KubeRouter.CNIInstaller.URI(),
-		PullPolicy:        c.clusterConf.Spec.Images.DefaultPullPolicy,
+		AutoMTU:           clusterConfig.Spec.Network.KubeRouter.IsAutoMTU(),
+		MTU:               clusterConfig.Spec.Network.KubeRouter.MTU,
+		MetricsPort:       clusterConfig.Spec.Network.KubeRouter.MetricsPort,
+		IPMasq:            clusterConfig.Spec.Network.KubeRouter.IPMasq,
+		CNIHairpin:        cniHairpin,
+		CNIImage:          clusterConfig.Spec.Images.KubeRouter.CNI.URI(),
+		CNIInstallerImage: clusterConfig.Spec.Images.KubeRouter.CNIInstaller.URI(),
+		PullPolicy:        clusterConfig.Spec.Images.DefaultPullPolicy,
+		Args:              append(args.ToDashedArgs(), clusterConfig.Spec.Network.KubeRouter.RawArgs...),
+	}
+
+	patches := clusterConfig.Spec.Network.KubeRouter.Patches
+	if reflect.DeepEqual(k.previousConfig, cfg) &&
+		reflect.DeepEqual(k.previousPatches, patches) {
+		k.log.Info("config matches with previous, not reconciling anything")
+		return nil
 	}
 
 	output := bytes.NewBuffer([]byte{})
-	tw := util.TemplateWriter{
+	tw := templatewriter.TemplateWriter{
 		Name:     "kube-router",
 		Template: kubeRouterTemplate,
 		Data:     cfg,
+		Patches:  patches,
 	}
 
 	err := tw.WriteToBuffer(output)
 	if err != nil {
-		return errors.Wrap(err, "error writing kube-router manifests, will NOT retry")
+		return fmt.Errorf("error writing kube-router manifests, will NOT retry: %w", err)
 	}
 
-	err = c.saver.Save("kube-router.yaml", output.Bytes())
-	if err != nil {
-		return errors.Wrap(err, "error writing kube-router manifests, will NOT retry")
-
+	if err := dir.Init(filepath.Join(k.k0sVars.ManifestsDir, "kuberouter"), constant.ManifestsDirMode); err != nil {
+		return err
 	}
 
+	if err := file.AtomicWithTarget(filepath.Join(k.k0sVars.ManifestsDir, "kuberouter", "kube-router.yaml")).
+		WithPermissions(constant.CertMode).
+		Write(output.Bytes()); err != nil {
+		return fmt.Errorf("error writing kube-router manifests, will NOT retry: %w", err)
+	}
+
+	k.previousConfig = cfg
+	k.previousPatches = patches
 	return nil
 }
 
+// Start implements [manager.Component].
+func (k *KubeRouter) Start(context.Context) error {
+	return nil
+}
+
+// from https://github.com/cloudnativelabs/kube-router/blob/master/daemonset/
 const kubeRouterTemplate = `---
 apiVersion: v1
 kind: ConfigMap
@@ -117,9 +247,10 @@ data:
              {{- if not .AutoMTU }}
              "mtu": {{ .MTU }},
              {{- end }}
-             "auto-mtu": {{ .AutoMTU }},
              "bridge":"kube-bridge",
              "isDefaultGateway":true,
+             "hairpinMode": {{ .CNIHairpin }},
+             "ipMasq": {{ .IPMasq }},
              "ipam":{
                 "type":"host-local"
              }
@@ -152,12 +283,16 @@ spec:
       labels:
         k8s-app: kube-router
         tier: node
+      {{- if gt .MetricsPort 0 }}
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "8080"
+        prometheus.io/port: "{{ .MetricsPort }}"
+      {{- end }}
     spec:
       priorityClassName: system-node-critical
       serviceAccountName: kube-router
+      nodeSelector:
+        kubernetes.io/os: linux
       initContainers:
         - name: install-cni-bins
           image: {{ .CNIInstallerImage }}
@@ -188,10 +323,9 @@ spec:
           - mountPath: /etc/kube-router
             name: kube-router-cfg
       hostNetwork: true
+      hostPID: true
       tolerations:
       - effect: NoSchedule
-        operator: Exists
-      - key: CriticalAddonsOnly
         operator: Exists
       - effect: NoExecute
         operator: Exists
@@ -218,30 +352,39 @@ spec:
         image: {{ .CNIImage }}
         imagePullPolicy: {{ .PullPolicy }}
         args:
-        - "--run-router=true"
-        - "--run-firewall=true"
-        - "--run-service-proxy=false"
-        - "--bgp-graceful-restart=true"
-        - "--metrics-port=8080"
-        {{- if .PeerRouterIPs }}
-        - "--peer-router-ips={{ .PeerRouterIPs }}"
-        {{- end }}
-        {{- if .PeerRouterASNs }}
-        - "--peer-router-asns={{ .PeerRouterASNs }}"
+        {{- range .Args }}
+        - {{ . | printf "%q" }}
         {{- end }}
         env:
         - name: NODE_NAME
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         - name: KUBE_ROUTER_CNI_CONF_FILE
           value: /etc/cni/net.d/10-kuberouter.conflist
+        ports:
+        - name: healthz
+          containerPort: 20244
         livenessProbe:
           httpGet:
             path: /healthz
-            port: 20244
-          initialDelaySeconds: 10
+            port: healthz
+          initialDelaySeconds: 300
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 6
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: healthz
           periodSeconds: 3
+          timeoutSeconds: 3
+          failureThreshold: 3
+          successThreshold: 3
         resources:
           requests:
             cpu: 250m
@@ -294,6 +437,28 @@ rules:
     - extensions
     resources:
       - networkpolicies
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - "coordination.k8s.io"
+    resources:
+      - leases
+    verbs:
+      - get
+      - create
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - services/status
+    verbs:
+      - update
+  - apiGroups:
+      - "discovery.k8s.io"
+    resources:
+      - endpointslices
     verbs:
       - get
       - list

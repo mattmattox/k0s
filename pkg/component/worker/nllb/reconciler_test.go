@@ -1,0 +1,828 @@
+// SPDX-FileCopyrightText: 2022 k0s authors
+// SPDX-License-Identifier: Apache-2.0
+
+package nllb
+
+import (
+	"context"
+	"errors"
+	"io/fs"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/k0sproject/k0s/internal/k0scontext"
+	internalnet "github.com/k0sproject/k0s/internal/pkg/net"
+	"github.com/k0sproject/k0s/pkg/apis/k0s/v1beta1"
+	"github.com/k0sproject/k0s/pkg/component/worker"
+	workerconfig "github.com/k0sproject/k0s/pkg/component/worker/config"
+	"github.com/k0sproject/k0s/pkg/config"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+
+	"github.com/avast/retry-go"
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/yaml"
+)
+
+func TestReconciler_Lifecycle(t *testing.T) {
+	createdReconciler := func(t *testing.T) *Reconciler {
+		t.Helper()
+		t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+
+		apiServer, err := internalnet.NewHostPort("127.99.99.99", 6443)
+		require.NoError(t, err)
+
+		dataDir := t.TempDir()
+		reconciler, err := NewReconciler(
+			&config.CfgVars{
+				DataDir:               dataDir,
+				KubeletAuthConfigPath: writeKubeconfig(t),
+			},
+			nil,
+			t.Name(),
+			workerconfig.Profile{
+				APIServerAddresses: []internalnet.HostPort{*apiServer},
+				NodeLocalLoadBalancing: &v1beta1.NodeLocalLoadBalancing{
+					Enabled:    true,
+					Type:       v1beta1.NllbTypeEnvoyProxy,
+					EnvoyProxy: v1beta1.DefaultEnvoyProxy(),
+				},
+				Konnectivity: workerconfig.Konnectivity{
+					AgentPort: 1337,
+				},
+			},
+			"test-node",
+		)
+		require.NoError(t, err)
+		reconciler.log = newTestLogger(t)
+		reconciler.loadBalancer = new(backendMock)
+
+		return reconciler
+	}
+
+	t.Run("when_created", func(t *testing.T) {
+
+		t.Run("init_succeeds", func(t *testing.T) {
+			underTest := createdReconciler(t)
+			ctx := testContext(t)
+			loadBalancer := underTest.loadBalancer.(*backendMock)
+			loadBalancer.On("init", ctx).Return(nil)
+
+			err := underTest.Init(ctx)
+
+			assert.NoError(t, err)
+			loadBalancer.AssertExpectations(t)
+		})
+
+		t.Run("start_fails", func(t *testing.T) {
+			underTest := createdReconciler(t)
+
+			err := underTest.Start(testContext(t))
+
+			require.Error(t, err)
+			assert.Equal(t, "cannot start, not initialized: created", err.Error())
+		})
+
+		t.Run("ready_fails", func(t *testing.T) {
+			underTest := createdReconciler(t)
+
+			err := underTest.Ready()
+
+			require.Error(t, err)
+			assert.Equal(t, "cannot check for readiness, not started: created", err.Error())
+		})
+
+		t.Run("stop_fails", func(t *testing.T) {
+			underTest := createdReconciler(t)
+
+			err := underTest.Stop()
+
+			require.Error(t, err)
+			assert.Equal(t, "cannot stop: created", err.Error())
+		})
+	})
+
+	initializedReconciler := func(t *testing.T) *Reconciler {
+		t.Helper()
+		underTest := createdReconciler(t)
+		ctx := testContext(t)
+		loadBalancer := underTest.loadBalancer.(*backendMock)
+		loadBalancer.On("init", ctx).Return(nil)
+
+		require.NoError(t, underTest.Init(ctx))
+		return underTest
+	}
+
+	t.Run("when_initialized", func(t *testing.T) {
+
+		t.Run("another_init_fails", func(t *testing.T) {
+			underTest := initializedReconciler(t)
+
+			err := underTest.Init(testContext(t))
+
+			require.Error(t, err)
+			assert.Equal(t, "cannot initialize, not created: initialized", err.Error())
+		})
+
+		t.Run("start_and_stop_succeed", func(t *testing.T) {
+			apiServer, err := internalnet.NewHostPort("127.99.99.99", 6443)
+			require.NoError(t, err)
+			underTest := initializedReconciler(t)
+			ctx := testContext(t)
+			loadBalancer := underTest.loadBalancer.(*backendMock)
+			loadBalancer.On("start", ctx, mock.Anything, mock.Anything).Return(nil)
+			getAPIServerAddressCalled := make(chan struct{})
+			loadBalancer.On("getAPIServerAddress").Return(apiServer, nil).Run(func(mock.Arguments) {
+				close(getAPIServerAddressCalled)
+			})
+
+			require.NoError(t, underTest.Start(ctx))
+
+			select {
+			case <-getAPIServerAddressCalled:
+				break
+			case <-time.After(10 * time.Second):
+				require.Fail(t, "Timed out while waiting for call to getAPIServerAddress")
+			}
+			loadBalancer.AssertExpectations(t)
+
+			loadBalancer.On("stop").Return(nil)
+
+			assert.NoError(t, underTest.Stop())
+
+			loadBalancer.AssertExpectations(t)
+		})
+
+		t.Run("ready_fails", func(t *testing.T) {
+			underTest := initializedReconciler(t)
+
+			err := underTest.Ready()
+
+			require.Error(t, err)
+			assert.Equal(t, "cannot check for readiness, not started: initialized", err.Error())
+		})
+
+		t.Run("stop_fails", func(t *testing.T) {
+			underTest := initializedReconciler(t)
+
+			err := underTest.Stop()
+
+			require.Error(t, err)
+			assert.Equal(t, "cannot stop: initialized", err.Error())
+		})
+	})
+
+	startedReconciler := func(t *testing.T) (_ *Reconciler, allowStop func()) {
+		t.Helper()
+		underTest := initializedReconciler(t)
+		apiServer, err := internalnet.NewHostPort("127.99.99.99", 6443)
+		require.NoError(t, err)
+		ctx := testContext(t)
+		loadBalancer := underTest.loadBalancer.(*backendMock)
+		loadBalancer.On("start", ctx, mock.Anything, mock.Anything).Return(nil)
+		loadBalancer.On("getAPIServerAddress").Maybe().Return(apiServer, nil)
+		require.NoError(t, underTest.Start(ctx))
+
+		var once sync.Once
+		allowStop = func() {
+			once.Do(func() {
+				loadBalancer.On("stop").Return(nil)
+			})
+		}
+
+		t.Cleanup(func() {
+			allowStop()
+			err := underTest.Stop()
+			if !t.Failed() {
+				assert.NoError(t, err)
+				loadBalancer.AssertExpectations(t)
+			}
+		})
+
+		return underTest, allowStop
+	}
+
+	t.Run("when_started", func(t *testing.T) {
+
+		t.Run("init_fails", func(t *testing.T) {
+			underTest, _ := startedReconciler(t)
+
+			err := underTest.Init(testContext(t))
+
+			require.Error(t, err)
+			assert.Equal(t, "cannot initialize, not created: started", err.Error())
+		})
+
+		t.Run("another_start_fails", func(t *testing.T) {
+			underTest, _ := startedReconciler(t)
+
+			err := underTest.Start(testContext(t))
+
+			require.Error(t, err)
+			assert.Equal(t, "cannot start, not initialized: started", err.Error())
+		})
+
+		t.Run("ready_succeeds", func(t *testing.T) {
+			underTest, _ := startedReconciler(t)
+
+			err := underTest.Ready()
+
+			assert.NoError(t, err)
+		})
+
+		t.Run("stop_succeeds", func(t *testing.T) {
+			underTest, allowStop := startedReconciler(t)
+			allowStop()
+
+			err := underTest.Stop()
+
+			assert.NoError(t, err)
+		})
+	})
+
+	stoppedReconciler := func(t *testing.T) *Reconciler {
+		t.Helper()
+		underTest, allowStop := startedReconciler(t)
+		allowStop()
+		require.NoError(t, underTest.Stop())
+		return underTest
+	}
+
+	t.Run("when_stopped", func(t *testing.T) {
+
+		t.Run("init_fails", func(t *testing.T) {
+			underTest := stoppedReconciler(t)
+
+			err := underTest.Init(testContext(t))
+
+			require.Error(t, err)
+			assert.Equal(t, "cannot initialize, not created: stopped", err.Error())
+		})
+
+		t.Run("start_fails", func(t *testing.T) {
+			underTest := stoppedReconciler(t)
+
+			err := underTest.Start(testContext(t))
+
+			require.Error(t, err)
+			assert.Equal(t, "cannot start, not initialized: stopped", err.Error())
+		})
+
+		t.Run("stop_succeeds", func(t *testing.T) {
+			underTest := stoppedReconciler(t)
+
+			err := underTest.Stop()
+
+			assert.NoError(t, err)
+		})
+	})
+}
+
+func TestReconciler_ConfigMgmt(t *testing.T) {
+	newTestInstance := func(t *testing.T, dataDir string, apiServers ...internalnet.HostPort) (*Reconciler, *staticPodMock) {
+		staticPod := new(staticPodMock)
+		staticPod.On("Drop").Return()
+
+		staticPods := new(staticPodsMock)
+		staticPods.On("ClaimStaticPod", mock.Anything, mock.Anything).Return(staticPod, nil)
+		reconciler, err := NewReconciler(
+			&config.CfgVars{
+				DataDir:               dataDir,
+				KubeletAuthConfigPath: writeKubeconfig(t),
+			},
+			staticPods,
+			t.Name(),
+			workerconfig.Profile{
+				APIServerAddresses: apiServers,
+				NodeLocalLoadBalancing: &v1beta1.NodeLocalLoadBalancing{
+					Enabled:    true,
+					Type:       v1beta1.NllbTypeEnvoyProxy,
+					EnvoyProxy: v1beta1.DefaultEnvoyProxy(),
+				},
+				Konnectivity: workerconfig.Konnectivity{
+					AgentPort: 1337,
+				},
+			},
+			"test-node",
+		)
+		require.NoError(t, err)
+		reconciler.log = newTestLogger(t)
+		return reconciler, staticPod
+	}
+
+	t.Run("configDir", func(t *testing.T) {
+		for _, test := range []struct {
+			name    string
+			prepare func(t *testing.T, dir string)
+		}{
+			{"create", func(t *testing.T, dir string) {}},
+			{"chmod", func(t *testing.T, dir string) {
+				require.NoError(t, os.Mkdir(filepath.Join(dir, "k0s"), 0777))
+				require.NoError(t, os.Mkdir(filepath.Join(dir, "k0s", "nllb"), 0777))
+			}},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				runtimeDir := t.TempDir()
+				t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+				expectedMode := 0700
+				if runtime.GOOS == "windows" {
+					expectedMode = 0777 // On Windows, file mode just mimics the read-only flag
+				}
+
+				test.prepare(t, runtimeDir)
+
+				underTest, _ := newTestInstance(t, t.TempDir())
+				err := underTest.Init(testContext(t))
+				require.NoError(t, err)
+
+				nllbDir := filepath.Join(runtimeDir, "k0s", "nllb")
+				stat, err := os.Stat(nllbDir)
+				require.NoError(t, err)
+				assert.True(t, stat.IsDir())
+
+				assert.Equal(t, expectedMode, int(stat.Mode()&fs.ModePerm))
+			})
+		}
+
+		t.Run("obstructed", func(t *testing.T) {
+			runtimeDir := t.TempDir()
+			t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+			k0sDir := filepath.Join(runtimeDir, "k0s")
+			require.NoError(t, os.WriteFile(k0sDir, []byte("obstructed"), 0777))
+
+			underTest, _ := newTestInstance(t, t.TempDir())
+			err := underTest.Init(testContext(t))
+
+			var pathErr *os.PathError
+			if assert.ErrorAs(t, err, &pathErr) {
+				assert.ErrorIs(t, pathErr.Err, syscall.ENOTDIR)
+				assert.Equal(t, k0sDir, pathErr.Path)
+			}
+		})
+	})
+
+	t.Run("configFile", func(t *testing.T) {
+		// given
+		runtimeDir := t.TempDir()
+		t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+		dataDir := t.TempDir()
+		envoyConfig := filepath.Join(runtimeDir, "k0s", "nllb", "envoy", "envoy.yaml")
+		apiServerAddress, err := internalnet.NewHostPort("127.10.10.1", 6443)
+		require.NoError(t, err)
+
+		// when
+		underTest, staticPod := newTestInstance(t, dataDir, *apiServerAddress)
+		t.Cleanup(func() {
+			assert.NoError(t, underTest.Stop())
+			assert.NoFileExists(t, envoyConfig)
+		})
+		err = underTest.Init(testContext(t))
+		require.NoError(t, err)
+
+		staticPod.On("SetManifest", mock.AnythingOfType("*v1.Pod")).Return(nil)
+		err = underTest.Start(testContext(t))
+		require.NoError(t, err)
+
+		// then
+		assert.NoError(t,
+			retry.Do(func() error {
+				stat, err := os.Stat(envoyConfig)
+				if os.IsNotExist(err) {
+					return err
+				}
+
+				if err == nil && stat.IsDir() {
+					err = errors.New("expected a file")
+				}
+
+				if err != nil {
+					return retry.Unrecoverable(err)
+				}
+
+				return nil
+			}, retry.LastErrorOnly(true)),
+			"Expected to see an Envoy configuration file",
+		)
+
+		configBytes, err := os.ReadFile(envoyConfig)
+		if assert.NoError(t, err) {
+			var yamlConfig any
+			assert.NoErrorf(t, yaml.Unmarshal(configBytes, &yamlConfig), "invalid YAML in config file: %s", string(configBytes))
+		}
+	})
+}
+
+func TestReconciler_APIServerAddressFromKubeconfig(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+
+	dataDir := t.TempDir()
+	apiServer, err := internalnet.NewHostPort("127.99.99.99", 443)
+	require.NoError(t, err)
+
+	loadBalancer := new(backendMock)
+	loadBalancer.On("init", mock.Anything).Return(nil)
+	loadBalancer.On("start", mock.Anything, mock.Anything, []internalnet.HostPort{*apiServer}).Return(nil)
+	loadBalancer.On("getAPIServerAddress").Maybe().Return(apiServer, nil)
+	loadBalancer.On("stop", mock.Anything).Return(nil)
+	underTest, err := NewReconciler(
+		&config.CfgVars{
+			DataDir:               dataDir,
+			KubeletAuthConfigPath: writeKubeconfig(t),
+		},
+		nil,
+		t.Name(),
+		workerconfig.Profile{
+			NodeLocalLoadBalancing: &v1beta1.NodeLocalLoadBalancing{
+				Enabled:    true,
+				Type:       v1beta1.NllbTypeEnvoyProxy,
+				EnvoyProxy: v1beta1.DefaultEnvoyProxy(),
+			},
+			Konnectivity: workerconfig.Konnectivity{
+				AgentPort: 1337,
+			},
+		},
+		"test-node",
+	)
+	require.NoError(t, err)
+	underTest.log = newTestLogger(t)
+	underTest.loadBalancer = loadBalancer
+	require.NoError(t, underTest.Init(testContext(t)))
+	require.NoError(t, underTest.Start(testContext(t)))
+	assert.NoError(t, underTest.Stop())
+
+	loadBalancer.AssertExpectations(t)
+}
+
+func TestReconciler_Patches(t *testing.T) {
+	const annotation = "test.k0sproject.io/patched"
+
+	// Starts an Envoy reconciler with the given patches and returns the
+	// provisioned manifest. Uses real static pods, so manifests get validated.
+	startWithPatches := func(t *testing.T, patches v1beta1.Patches, eventReactors ...k8stesting.ReactionFunc) (*Reconciler, *fake.Clientset, *corev1.Pod) {
+		t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+
+		staticPods := &recordingStaticPods{StaticPods: worker.NewStaticPods()}
+		envoyProxy := v1beta1.DefaultEnvoyProxy()
+		envoyProxy.Patches = patches
+		underTest, err := NewReconciler(
+			&config.CfgVars{
+				DataDir:               t.TempDir(),
+				KubeletAuthConfigPath: writeKubeconfig(t),
+			},
+			staticPods,
+			t.Name(),
+			workerconfig.Profile{
+				NodeLocalLoadBalancing: &v1beta1.NodeLocalLoadBalancing{
+					Enabled:    true,
+					Type:       v1beta1.NllbTypeEnvoyProxy,
+					EnvoyProxy: envoyProxy,
+				},
+				Konnectivity: workerconfig.Konnectivity{
+					AgentPort: 1337,
+				},
+			},
+			"test-node",
+		)
+		require.NoError(t, err)
+		underTest.log = newTestLogger(t)
+		client := fake.NewClientset()
+		for _, reactor := range eventReactors {
+			client.PrependReactor("create", "events", reactor)
+		}
+		// Stubbing out the resolver and kubernetes client here, not only to
+		// inject fake implementations, but also to prevent network usage inside
+		// synctest bubbles. The net package uses lazily initialized global
+		// channel variables, e.g. when reading resolv.conf. If initialization
+		// happens inside a bubble, global state becomes bound to it, leaving
+		// behind a broken network stack for everything outside that bubble.
+		ctx := k0scontext.WithValue[ipAddrResolver](t.Context(), loopbackStubResolver{})
+		underTest.clientFromKubeconfig = func(path string) (kubernetes.Interface, error) {
+			switch path {
+			case underTest.regularKubeconfigPath:
+				return client, nil
+			default: //nolint:gocritic // fallthrough
+				assert.Failf(t, "Unexpected kubeconfig path", "%q", path)
+				fallthrough
+			case underTest.loadBalancedKubeconfigPath:
+				// Just create a throw-away client.
+				return fake.NewClientset(), nil
+			}
+		}
+
+		require.NoError(t, underTest.Init(ctx))
+		require.NoError(t, underTest.Start(ctx))
+		t.Cleanup(func() { assert.NoError(t, underTest.Stop()) })
+
+		require.NotNil(t, staticPods.manifest, "no manifest provisioned")
+		return underTest, client, toPod(t, staticPods.manifest)
+	}
+
+	brokenPatches := v1beta1.Patches{
+		{
+			Target: v1beta1.PatchTarget{Kind: "Pod", Name: "nllb"},
+			Patch: v1beta1.PatchSpec{
+				Type:    v1beta1.MergePatchType,
+				Content: `{"metadata": {"annotations": {"` + annotation + `": "true"}}}`,
+			},
+		},
+		{
+			Target: v1beta1.PatchTarget{Kind: "Pod", Name: "nllb"},
+			Patch: v1beta1.PatchSpec{
+				Type:    v1beta1.JSONPatchType,
+				Content: `[{"op": "replace", "path": "/spec/doesNotExist", "value": "foo"}]`,
+			},
+		},
+	}
+
+	// The kubelet's kubeconfig points to the load balancer in any case.
+	assertLoadBalancedKubeconfig := func(t *testing.T, underTest *Reconciler) {
+		kubeconfig, err := clientcmd.LoadFromFile(underTest.GetKubeletKubeconfigPath())
+		if assert.NoError(t, err) {
+			cluster := kubeconfig.Clusters[kubeconfig.Contexts[kubeconfig.CurrentContext].Cluster]
+			assert.Contains(t, cluster.Server, ":7443")
+		}
+	}
+
+	t.Run("applied", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			underTest, client, manifest := startWithPatches(t, v1beta1.Patches{{
+				Target: v1beta1.PatchTarget{Kind: "Pod", Name: "nllb"},
+				Patch: v1beta1.PatchSpec{
+					Type:    v1beta1.MergePatchType,
+					Content: `{"metadata": {"annotations": {"` + annotation + `": "true"}}}`,
+				},
+			}})
+
+			assert.Equal(t, "true", manifest.Annotations[annotation])
+			assertLoadBalancedKubeconfig(t, underTest)
+			synctest.Wait()
+			assert.Empty(t, client.Actions(), "no events expected")
+		})
+	})
+
+	t.Run("failed_falls_back_to_unpatched", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			underTest, client, manifest := startWithPatches(t, brokenPatches)
+
+			// None of the patches got applied, not even the valid one.
+			assert.NotContains(t, manifest.Annotations, annotation)
+			assert.Equal(t, "nllb", manifest.Name)
+			if assert.Len(t, manifest.Spec.Containers, 1) {
+				assert.Equal(t, "nllb", manifest.Spec.Containers[0].Name)
+			}
+			assertLoadBalancedKubeconfig(t, underTest)
+
+			synctest.Wait()
+			event := getEvent(t, client)
+			assert.Equal(t, corev1.ObjectReference{
+				APIVersion: "v1",
+				Kind:       "Node",
+				Name:       "test-node",
+				UID:        "test-node",
+			}, event.InvolvedObject)
+			assert.Equal(t, corev1.EventTypeWarning, event.Type)
+			assert.Equal(t, "NodeLocalLoadBalancingPatchFailed", event.Reason)
+			assert.Equal(t, corev1.EventSource{Component: "nllb", Host: "test-node"}, event.Source)
+			assert.Equal(t,
+				"Failed to apply patches to the node-local load balancer, running it without patches. "+
+					"Fix the patches in the cluster configuration and restart the worker. "+
+					"Error: failed to patch NLLB pod: error patching resource (Pod/nllb): "+
+					"replace operation does not apply: doc is missing key: /spec/doesNotExist: missing value",
+				event.Message,
+			)
+		})
+	})
+
+	t.Run("rejected_falls_back_to_unpatched", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			_, client, manifest := startWithPatches(t, v1beta1.Patches{{
+				Target: v1beta1.PatchTarget{Kind: "Pod", Name: "nllb"},
+				Patch: v1beta1.PatchSpec{
+					Type:    v1beta1.MergePatchType,
+					Content: `{"metadata": {"name": "renamed"}}`,
+				},
+			}})
+
+			assert.Equal(t, "nllb", manifest.Name)
+			synctest.Wait()
+			assert.Contains(t, getEvent(t, client).Message,
+				`failed to set manifest of patched NLLB pod: attempt to set the manifest to "kube-system/renamed", whereas "kube-system/nllb" was claimed`,
+			)
+		})
+	})
+
+	t.Run("event_creation_is_retried", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var attempts atomic.Uint32
+			_, client, _ := startWithPatches(t, brokenPatches, func(k8stesting.Action) (bool, k8sruntime.Object, error) {
+				if attempts.Add(1) == 1 {
+					return true, nil, assert.AnError
+				}
+				return false, nil, nil
+			})
+
+			synctest.Wait()
+			assert.EqualValues(t, 1, attempts.Load(), "Exactly one event creation attempt is expected at this point")
+			if events, err := client.CoreV1().Events(metav1.NamespaceDefault).List(t.Context(), metav1.ListOptions{}); assert.NoError(t, err) {
+				assert.Empty(t, events.Items, "Expected no events to be created yet")
+			}
+
+			// Sleep for the retry delay plus retry-go's default jitter
+			synctest.Sleep(1*time.Second + 100*time.Millisecond)
+			assert.EqualValues(t, 2, attempts.Load(), "Exactly two event creation attempts are expected at this point")
+			_ = getEvent(t, client) // Assert that the event has been created
+		})
+	})
+}
+
+// getEvent returns the single event that has been recorded in the default
+// namespace.
+func getEvent(t *testing.T, client kubernetes.Interface) corev1.Event {
+	t.Helper()
+	events, err := client.CoreV1().Events(metav1.NamespaceDefault).List(t.Context(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, events.Items, 1)
+	return events.Items[0]
+}
+
+// toPod decodes a provisioned manifest.
+func toPod(t *testing.T, manifest any) *corev1.Pod {
+	t.Helper()
+	switch manifest := manifest.(type) {
+	case *corev1.Pod:
+		return manifest
+	case []byte:
+		var pod corev1.Pod
+		require.NoError(t, yaml.Unmarshal(manifest, &pod))
+		return &pod
+	default:
+		require.Failf(t, "Unexpected manifest type", "%T", manifest)
+		return nil
+	}
+}
+
+// recordingStaticPods records the last manifest accepted by real static pods.
+type recordingStaticPods struct {
+	worker.StaticPods
+	manifest any
+}
+
+func (s *recordingStaticPods) ClaimStaticPod(namespace, name string) (worker.StaticPod, error) {
+	pod, err := s.StaticPods.ClaimStaticPod(namespace, name)
+	if err != nil {
+		return nil, err
+	}
+	return &recordingStaticPod{pod, s}, nil
+}
+
+type recordingStaticPod struct {
+	worker.StaticPod
+	pods *recordingStaticPods
+}
+
+func (p *recordingStaticPod) SetManifest(podResource any) error {
+	if err := p.StaticPod.SetManifest(podResource); err != nil {
+		return err
+	}
+	p.pods.manifest = podResource
+	return nil
+}
+
+func TestPatchPod(t *testing.T) {
+	pod := &corev1.Pod{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
+		ObjectMeta: metav1.ObjectMeta{Name: "nllb", Namespace: metav1.NamespaceSystem},
+	}
+	patch := func(patchType v1beta1.PatchType, content string) v1beta1.Patches {
+		return v1beta1.Patches{{
+			Target: v1beta1.PatchTarget{Kind: "Pod", Name: "nllb"},
+			Patch:  v1beta1.PatchSpec{Type: patchType, Content: content},
+		}}
+	}
+
+	t.Run("succeeds", func(t *testing.T) {
+		patched, err := patchPod(pod, patch(v1beta1.MergePatchType, `{"metadata": {"labels": {"foo": "bar"}}}`))
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{"foo": "bar"}, toPod(t, patched).Labels)
+		assert.Empty(t, pod.Labels, "original pod must not be modified")
+	})
+
+	t.Run("patch_fails", func(t *testing.T) {
+		patched, err := patchPod(pod, patch(v1beta1.JSONPatchType, `[{"op": "replace", "path": "/spec/doesNotExist", "value": "foo"}]`))
+		assert.ErrorContains(t, err, "doc is missing key: /spec/doesNotExist")
+		assert.Nil(t, patched)
+	})
+}
+
+func writeKubeconfig(t *testing.T) string {
+	t.Helper()
+
+	const fake = "fake"
+	kubeconfig := clientcmdapi.Config{
+		Clusters:       map[string]*clientcmdapi.Cluster{fake: {Server: "https://127.99.99.99/fake"}},
+		Contexts:       map[string]*clientcmdapi.Context{fake: {Cluster: fake}},
+		CurrentContext: fake,
+	}
+
+	path := filepath.Join(t.TempDir(), "kubeconfig")
+	require.NoError(t, clientcmd.WriteToFile(kubeconfig, path))
+	return path
+}
+
+func testContext(t *testing.T) context.Context {
+	timeout := errors.New("timeout: " + t.Name())
+	ctx, cancel := context.WithCancelCause(t.Context())
+	timer := time.AfterFunc(10*time.Second, func() { cancel(timeout) })
+
+	t.Cleanup(func() {
+		timer.Stop()
+		if errors.Is(context.Cause(ctx), timeout) {
+			assert.Fail(t, "Test context timed out after 10 seconds")
+		}
+	})
+	return ctx
+}
+
+func newTestLogger(t *testing.T) logrus.FieldLogger {
+	log := logrus.New()
+	log.SetLevel(logrus.DebugLevel)
+	return log.WithField("test", t.Name())
+}
+
+type backendMock struct{ mock.Mock }
+
+func (m *backendMock) getAPIServerAddress() (*internalnet.HostPort, error) {
+	args := m.Called()
+	return args.Get(0).(*internalnet.HostPort), args.Error(1)
+}
+
+func (m *backendMock) init(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
+}
+
+func (m *backendMock) start(ctx context.Context, profile workerconfig.Profile, apiServers []internalnet.HostPort) error {
+	args := m.Called(ctx, profile, apiServers)
+	return args.Error(0)
+}
+
+func (m *backendMock) stop() {
+	m.Called()
+}
+
+func (m *backendMock) updateAPIServers(apiServers []internalnet.HostPort) error {
+	args := m.Called(apiServers)
+	return args.Error(0)
+}
+
+type staticPodsMock struct{ mock.Mock }
+
+func (m *staticPodsMock) ManifestURL() (*url.URL, error) {
+	args := m.Called()
+	return args.Get(0).(*url.URL), args.Error(1)
+}
+
+func (m *staticPodsMock) ClaimStaticPod(namespace, name string) (worker.StaticPod, error) {
+	args := m.Called(namespace, name)
+	return args.Get(0).(worker.StaticPod), args.Error(1)
+}
+
+type staticPodMock struct{ mock.Mock }
+
+func (m *staticPodMock) SetManifest(podResource any) error {
+	args := m.Called(podResource)
+	return args.Error(0)
+}
+
+func (m *staticPodMock) Clear() {
+	m.Called()
+}
+
+func (m *staticPodMock) Drop() {
+	m.Called()
+}
+
+type loopbackStubResolver struct{}
+
+func (loopbackStubResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, error) {
+	return []net.IPAddr{{IP: net.IP{127, 0, 0, 1}}}, nil
+}

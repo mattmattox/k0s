@@ -1,60 +1,84 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package kubeconfig
 
 import (
+	"errors"
 	"fmt"
-	"io/ioutil"
-	"os"
-	"strings"
+	"io/fs"
+	"path/filepath"
 
-	"github.com/cloudflare/cfssl/log"
-	"github.com/k0sproject/k0s/internal/util"
 	"github.com/k0sproject/k0s/pkg/config"
+
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+
 	"github.com/spf13/cobra"
 )
 
 func kubeConfigAdminCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "admin [command]",
+		Use:   "admin",
 		Short: "Display Admin's Kubeconfig file",
 		Long:  "Print kubeconfig for the Admin user to stdout",
 		Example: `	$ k0s kubeconfig admin > ~/.kube/config
 	$ export KUBECONFIG=~/.kube/config
 	$ kubectl get nodes`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			c := CmdOpts(config.GetCmdOpts())
-			if util.FileExists(c.K0sVars.AdminKubeConfigPath) {
-				content, err := ioutil.ReadFile(c.K0sVars.AdminKubeConfigPath)
-				if err != nil {
-					log.Fatal(err)
-				}
-
-				clusterAPIURL, err := c.getAPIURL()
-				if err != nil {
-					return fmt.Errorf("failed to fetch cluster's API Address: %w", err)
-				}
-				newContent := strings.Replace(string(content), "https://localhost:6443", clusterAPIURL, -1)
-				os.Stdout.Write([]byte(newContent))
-			} else {
-				return fmt.Errorf("failed to read admin config, check if the control plane is initialized on this node")
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			opts, err := config.GetCmdOpts(cmd)
+			if err != nil {
+				return err
 			}
-			return nil
+
+			nodeConfig, err := opts.K0sVars.NodeConfig()
+			if err != nil {
+				return err
+			}
+
+			const (
+				clusterName = "local"
+				contextName = "Default"
+				userName    = "user"
+			)
+
+			adminConfig := clientcmdapi.Config{
+				Clusters: map[string]*clientcmdapi.Cluster{clusterName: {
+					Server:               nodeConfig.Spec.API.APIAddressURL(),
+					CertificateAuthority: filepath.Join(opts.K0sVars.CertRootDir, "ca.crt"),
+				}},
+				Contexts: map[string]*clientcmdapi.Context{contextName: {
+					Cluster:  clusterName,
+					AuthInfo: userName,
+				}},
+				CurrentContext: contextName,
+				AuthInfos: map[string]*clientcmdapi.AuthInfo{userName: {
+					ClientCertificate: filepath.Join(opts.K0sVars.CertRootDir, "admin.crt"),
+					ClientKey:         filepath.Join(opts.K0sVars.CertRootDir, "admin.key"),
+				}},
+			}
+
+			if err := clientcmdapi.FlattenConfig(&adminConfig); err != nil {
+				if pathErr, ok := errors.AsType[*fs.PathError](err); ok &&
+					filepath.Dir(pathErr.Path) == opts.K0sVars.CertRootDir &&
+					errors.Is(pathErr.Err, fs.ErrNotExist) {
+					return fmt.Errorf("admin PKI file %q not found, check if the control plane is initialized on this node", pathErr.Path)
+				}
+				return fmt.Errorf("failed to create admin kubeconfig: %w", err)
+			}
+
+			data, err := clientcmd.Write(adminConfig)
+			if err != nil {
+				return fmt.Errorf("failed to serialize admin kubeconfig: %w", err)
+			}
+
+			_, err = cmd.OutOrStdout().Write(data)
+			return err
 		},
 	}
-	cmd.PersistentFlags().AddFlagSet(config.GetPersistentFlagSet())
+
+	cmd.Flags().AddFlagSet(config.GetPersistentFlagSet())
+
 	return cmd
 }

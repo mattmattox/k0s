@@ -1,57 +1,59 @@
-/*
-Copyright 2021 k0s authors
+//go:build unix
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+// SPDX-FileCopyrightText: 2021 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package token
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/cobra"
+	"github.com/k0sproject/k0s/pkg/component/status"
+	"github.com/k0sproject/k0s/pkg/config"
+	"github.com/k0sproject/k0s/pkg/token"
+
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 
-	"github.com/k0sproject/k0s/pkg/config"
-	"github.com/k0sproject/k0s/pkg/token"
+	"github.com/spf13/cobra"
 )
 
-var createTokenRole string
-
 func tokenCreateCmd() *cobra.Command {
+	var (
+		createTokenRole string
+		tokenExpiry     string
+		waitCreate      bool
+	)
+
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create join token",
 		Example: `k0s token create --role worker --expiry 100h //sets expiration time to 100 hours
 k0s token create --role worker --expiry 10m  //sets expiration time to 10 minutes
 `,
-		PreRunE: checkCreateTokenRole,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			// Disable logrus for token commands
-			logrus.SetLevel(logrus.FatalLevel)
-			c := CmdOpts(config.GetCmdOpts())
-			clusterConfig, err := config.GetYamlFromFile(c.CfgFile, c.K0sVars)
+		Args: cobra.NoArgs,
+		PreRunE: func(cmd *cobra.Command, _ []string) error {
+			return checkTokenRole(createTokenRole)
+		},
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			opts, err := config.GetCmdOpts(cmd)
 			if err != nil {
 				return err
 			}
+
 			expiry, err := time.ParseDuration(tokenExpiry)
 			if err != nil {
 				return err
 			}
 
-			var bootstrapConfig string
+			nodeConfig, err := opts.K0sVars.NodeConfig()
+			if err != nil {
+				return err
+			}
+
+			var bootstrapToken string
 			// we will retry every second for two minutes and then error
 			err = retry.OnError(wait.Backoff{
 				Steps:    120,
@@ -61,33 +63,45 @@ k0s token create --role worker --expiry 10m  //sets expiration time to 10 minute
 			}, func(err error) bool {
 				return waitCreate
 			}, func() error {
-				bootstrapConfig, err = token.CreateKubeletBootstrapConfig(clusterConfig, c.K0sVars, createTokenRole, expiry)
+				statusInfo, err := status.GetStatusInfo(opts.K0sVars.StatusSocketPath)
+				if err != nil {
+					return fmt.Errorf("failed to get k0s status: %w", err)
+				}
+				if statusInfo == nil {
+					return config.ErrK0sNotRunning
+				}
+				if err = ensureTokenCreationAcceptable(createTokenRole, statusInfo); err != nil {
+					waitCreate = false
+					return err
+				}
 
+				bootstrapToken, err = token.CreateKubeletBootstrapToken(cmd.Context(), nodeConfig.Spec.API, opts.K0sVars, createTokenRole, expiry)
 				return err
 			})
 			if err != nil {
 				return err
 			}
-
-			fmt.Println(bootstrapConfig)
-
+			fmt.Fprintln(cmd.OutOrStdout(), bootstrapToken)
 			return nil
 		},
 	}
-	// append flags
-	cmd.PersistentFlags().AddFlagSet(config.GetPersistentFlagSet())
 
-	cmd.Flags().StringVar(&tokenExpiry, "expiry", "0s", "Expiration time of the token. Format 1.5h, 2h45m or 300ms.")
-	cmd.Flags().StringVar(&createTokenRole, "role", "worker", "Either worker or controller")
-	cmd.Flags().BoolVar(&waitCreate, "wait", false, "wait forever (default false)")
+	flags := cmd.Flags()
+	flags.AddFlagSet(config.GetPersistentFlagSet())
+	flags.StringVar(&tokenExpiry, "expiry", "0s", "Expiration time of the token. Format 1.5h, 2h45m or 300ms.")
+	flags.StringVar(&createTokenRole, "role", "worker", "Either worker or controller")
+	flags.BoolVar(&waitCreate, "wait", false, "wait forever (default false)")
 
 	return cmd
 }
 
-func checkCreateTokenRole(cmd *cobra.Command, args []string) error {
-	if createTokenRole != controllerRole && createTokenRole != workerRole {
-		cmd.SilenceUsage = true
-		return fmt.Errorf("unsupported role %q, supported roles are %q and %q", createTokenRole, controllerRole, workerRole)
+func ensureTokenCreationAcceptable(createTokenRole string, statusInfo *status.K0sStatus) error {
+	if statusInfo.SingleNode {
+		return errors.New("refusing to create token: cannot join into a single node cluster")
 	}
+	if createTokenRole == token.RoleController && !statusInfo.ClusterConfig.Spec.Storage.IsJoinable() {
+		return errors.New("refusing to create token: cannot join controller into current storage")
+	}
+
 	return nil
 }

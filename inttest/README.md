@@ -1,6 +1,11 @@
+<!--
+SPDX-FileCopyrightText: 2020 k0s authors
+SPDX-License-Identifier: CC-BY-SA-4.0
+-->
+
 # Integration tests a.k.a e2e testing
 
-This folder is the root of k0s integration tests. These tests are such that run the actual k0s clusters, currently using [footloose](https://github.com/weaveworks/footloose) as the target environment.
+This folder is the root of k0s integration tests. These tests are such that run the actual k0s clusters, currently using [bootloose](https://github.com/k0sproject/bootloose) as the target environment.
 
 ## Running the tests
 
@@ -21,14 +26,10 @@ Sometimes, especially when debugging some test failures, it's good to leave the 
 The test output show how to run manual cleanup for the environment, something like:
 
 ```shell
-TestNetworkSuite: footloosesuite.go:138: footloose cluster left intact for debugging. Needs to be manually cleaned with: footloose delete --config /tmp/afghzzvp-footloose.yaml
+TestNetworkSuite: bootloosesuite.go:138: bootloose cluster left intact for debugging. Needs to be manually cleaned with: bootloose delete --config /tmp/afghzzvp-bootloose.yaml
 ```
 
 This allows you to run manual cleanup after you've done the needed debugging.
-
-## Long term plans
-
-We're planning to build some abstractions on the suite level to be able to create the test environment also using some cloud provider infrastructure. We'll probably build that using Terraform as that provides nice abstraction over different providers. This means we need to create some abstraction that defines the set of machines and adjacent details (addresses, keys etc.) we're using for testing. This should make it possible to run the tests across many different cloud providers with little effort.
 
 ## Which tests to run when?
 

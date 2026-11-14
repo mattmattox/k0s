@@ -1,157 +1,116 @@
-/*
-Copyright 2021 k0s authors
+// SPDX-FileCopyrightText: 2020 k0s authors
+// SPDX-License-Identifier: Apache-2.0
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-package applier
+package applier_test
 
 import (
-	"context"
-	"fmt"
-	"io/ioutil"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
+	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	kubeutil "github.com/k0sproject/k0s/internal/testutil"
+	"github.com/k0sproject/k0s/pkg/applier"
 )
 
 func TestApplierAppliesAllManifestsInADirectory(t *testing.T) {
-	dir, err := ioutil.TempDir("", "applier-test-*")
-	assert.NoError(t, err)
+	dir := t.TempDir()
 	templateNS := `
 apiVersion: v1
 kind: Namespace
 metadata:
-  name:  kube-system
+  name: kube-system
 `
 	template := `
-kind: ConfigMap
 apiVersion: v1
-metadata:
-  name: applier-test
-  namespace: kube-system
-  labels:
-    component: applier
-data:
-  foo: bar
-`
-	template2 := `
-kind: Pod
-apiVersion: v1
-metadata:
-  name: applier-test
-  namespace: kube-system
-  labels:
-    component: applier
-spec:
-  containers:
-    - name: nginx
-      image: nginx:1.15
+kind: List
+items:
+  - kind: ConfigMap
+    apiVersion: v1
+    metadata:
+      name: applier-test
+      namespace: kube-system
+      labels:
+        component: applier
+    data:
+      foo: bar
+  - kind: Pod
+    apiVersion: v1
+    metadata:
+      name: applier-test
+      namespace: kube-system
+      labels:
+        component: applier
+    spec:
+      containers:
+      - name: app
+        image: registry.example.com/some/app:1
 `
 
 	templateDeployment := `
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: nginx
+  name: app
   namespace: kube-system
 spec:
   selector:
     matchLabels:
-      app: nginx
+      app: app
   template:
     metadata:
       labels:
-       app: nginx
+       app: app
     spec:
       containers:
-      - name: nginx
-        image: docker.io/nginx:1-alpine
-        resources:
-          limits:
-            memory: "64Mi"
-            cpu: "100m"
-        ports:
-          - containerPort: 80	
+      - name: app
+        image: registry.example.com/some/app:1
 `
-	assert.NoError(t, ioutil.WriteFile(fmt.Sprintf("%s/test-ns.yaml", dir), []byte(templateNS), 0400))
-	assert.NoError(t, ioutil.WriteFile(fmt.Sprintf("%s/test.yaml", dir), []byte(template), 0400))
-	assert.NoError(t, ioutil.WriteFile(fmt.Sprintf("%s/test-pod.yaml", dir), []byte(template2), 0400))
-	assert.NoError(t, ioutil.WriteFile(fmt.Sprintf("%s/test-deploy.yaml", dir), []byte(templateDeployment), 0400))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "test-ns.yaml"), []byte(templateNS), 0400))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "test-list.yaml"), []byte(template), 0400))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "test-deploy.yaml"), []byte(templateDeployment), 0400))
 
 	fakes := kubeutil.NewFakeClientFactory()
-	verbs := []string{"get", "list", "delete", "create"}
-	fakes.RawDiscovery.Resources = []*metav1.APIResourceList{
-		{
-			GroupVersion: corev1.SchemeGroupVersion.String(),
-			APIResources: []metav1.APIResource{
-				{Name: "nodes", Namespaced: false, Kind: "Node", Verbs: verbs},
-				{Name: "pods", Namespaced: true, Kind: "Pod", Verbs: verbs},
-				{Name: "configmaps", Namespaced: true, Kind: "ConfigMap", Verbs: verbs},
-				{Name: "namespaces", Namespaced: false, Kind: "Namespace", Verbs: verbs},
-			},
-		},
-		{
-			GroupVersion: appsv1.SchemeGroupVersion.String(),
-			APIResources: []metav1.APIResource{
-				{Name: "deployments", Namespaced: true, Kind: "Deployment", Verbs: verbs},
-			},
-		},
-	}
+	clients := applier.NewClients(fakes)
+	a := applier.NewApplier(dir, clients)
 
-	a := NewApplier(dir, fakes)
-	assert.NoError(t, err)
-
-	err = a.Apply()
+	ctx := t.Context()
+	err := a.Apply(ctx)
 	assert.NoError(t, err)
 	gv, _ := schema.ParseResourceArg("configmaps.v1.")
-	r, err := a.client.Resource(*gv).Namespace("kube-system").Get(context.Background(), "applier-test", metav1.GetOptions{})
-	assert.NoError(t, err)
-	assert.Equal(t, "applier", r.GetLabels()["component"])
+	r, err := fakes.DynamicClient.Resource(*gv).Namespace(metav1.NamespaceSystem).Get(ctx, "applier-test", metav1.GetOptions{})
+	if assert.NoError(t, err) {
+		assert.Equal(t, "applier", r.GetLabels()["component"])
+	}
 	podgv, _ := schema.ParseResourceArg("pods.v1.")
-	r, err = a.client.Resource(*podgv).Namespace("kube-system").Get(context.Background(), "applier-test", metav1.GetOptions{})
-	assert.NoError(t, err)
-	assert.Equal(t, "Pod", r.GetKind())
-	assert.Equal(t, "applier", r.GetLabels()["component"])
+	r, err = fakes.DynamicClient.Resource(*podgv).Namespace(metav1.NamespaceSystem).Get(ctx, "applier-test", metav1.GetOptions{})
+	if assert.NoError(t, err) {
+		assert.Equal(t, "Pod", r.GetKind())
+		assert.Equal(t, "applier", r.GetLabels()["component"])
+	}
 	deployGV, _ := schema.ParseResourceArg("deployments.v1.apps")
-	_, err = a.client.Resource(*deployGV).Namespace("kube-system").Get(context.Background(), "nginx", metav1.GetOptions{})
+	_, err = fakes.DynamicClient.Resource(*deployGV).Namespace(metav1.NamespaceSystem).Get(ctx, "app", metav1.GetOptions{})
 	assert.NoError(t, err)
 
 	// Attempt to delete the stack with a different applier
-	a2 := NewApplier(dir, fakes)
-	assert.NoError(t, a2.Delete())
+	a2 := applier.NewApplier(dir, clients)
+	assert.NoError(t, a2.Delete(ctx))
 	// Check that the resources are deleted
-	_, err = a.client.Resource(*gv).Namespace("kube-system").Get(context.Background(), "applier-test", metav1.GetOptions{})
-	assert.Error(t, err)
+	_, err = fakes.DynamicClient.Resource(*gv).Namespace(metav1.NamespaceSystem).Get(ctx, "applier-test", metav1.GetOptions{})
 	assert.True(t, errors.IsNotFound(err))
 
-	_, err = a.client.Resource(*podgv).Namespace("kube-system").Get(context.Background(), "applier-test", metav1.GetOptions{})
-	assert.Error(t, err)
+	_, err = fakes.DynamicClient.Resource(*podgv).Namespace(metav1.NamespaceSystem).Get(ctx, "applier-test", metav1.GetOptions{})
 	assert.True(t, errors.IsNotFound(err))
 
-	_, err = a.client.Resource(*deployGV).Namespace("kube-system").Get(context.Background(), "nginx", metav1.GetOptions{})
-	assert.Error(t, err)
+	_, err = fakes.DynamicClient.Resource(*deployGV).Namespace(metav1.NamespaceSystem).Get(ctx, "app", metav1.GetOptions{})
 	assert.True(t, errors.IsNotFound(err))
 
 	gvNS, _ := schema.ParseResourceArg("namespaces.v1.")
-	_, err = a.client.Resource(*gvNS).Get(context.Background(), "kube-system", metav1.GetOptions{})
-	assert.Error(t, err)
+	_, err = fakes.DynamicClient.Resource(*gvNS).Get(ctx, metav1.NamespaceSystem, metav1.GetOptions{})
 	assert.True(t, errors.IsNotFound(err))
-
 }

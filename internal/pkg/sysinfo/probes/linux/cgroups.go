@@ -1,0 +1,138 @@
+//go:build linux
+
+// SPDX-FileCopyrightText: 2022 k0s authors
+// SPDX-License-Identifier: Apache-2.0
+
+package linux
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"sync"
+	"syscall"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/k0sproject/k0s/internal/pkg/sysinfo/probes"
+)
+
+type CgroupsProbes struct {
+	probes.Probes
+
+	path              probes.ProbePath
+	probeUname        unameProber
+	probeCgroupSystem cgroupSystemProber
+}
+
+func (p *LinuxProbes) RequireCgroups() *CgroupsProbes {
+	var c *CgroupsProbes
+	p.Set("cgroups", func(path probes.ProbePath, current probes.Probe) probes.Probe {
+		if probe, ok := current.(*CgroupsProbes); ok {
+			c = probe
+			return c
+		}
+
+		c = newCgroupsProbes(path, p.probeUname, "/sys/fs/cgroup")
+		return c
+	})
+
+	return c
+}
+
+func newCgroupsProbes(path probes.ProbePath, unameProber unameProber, mountPoint string) *CgroupsProbes {
+	return &CgroupsProbes{
+		probes.NewProbesAtPath(path),
+
+		path,
+		unameProber,
+		newCgroupSystemProber(unameProber, mountPoint),
+	}
+}
+
+func (c *CgroupsProbes) Probe(reporter probes.Reporter) error {
+	if err := c.probe(reporter); err != nil {
+		return err
+	}
+
+	return c.Probes.Probe(reporter)
+}
+
+func (c *CgroupsProbes) probe(reporter probes.Reporter) error {
+	desc := probes.NewProbeDesc("Control Groups", c.path)
+	sys, err := c.probeCgroupSystem()
+	if err != nil {
+		return reportCgroupSystemErr(reporter, desc, err)
+	}
+	if _, ok := sys.(*cgroupV1); ok {
+		return reporter.Reject(desc, sys, "cgroup v1 is not supported")
+	}
+	return reporter.Pass(desc, sys)
+}
+
+func reportCgroupSystemErr(reporter probes.Reporter, d probes.ProbeDesc, err error) error {
+	if detectionFailedErr, ok := errors.AsType[cgroupFsDetectionFailed](err); ok {
+		return reporter.Reject(d, detectionFailedErr, "")
+	}
+
+	return reporter.Error(d, err)
+}
+
+type cgroupSystem interface {
+	probes.ProbedProp
+	probeController(string) (cgroupControllerAvailable, error)
+	loadControllers(func(name, msg string)) error
+}
+
+type cgroupSystemProber func() (cgroupSystem, error)
+
+func loadCgroupSystem(probeUname unameProber, mountPoint string) (cgroupSystem, error) {
+	// https://man7.org/linux/man-pages/man7/cgroups.7.html
+
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(mountPoint, &st); err != nil {
+		if os.IsNotExist(err) {
+			msg := fmt.Sprintf("no file system mounted at %q", mountPoint)
+			return nil, cgroupFsDetectionFailed(msg)
+		}
+
+		return nil, fmt.Errorf("failed to stat %q: %w", mountPoint, err)
+	}
+
+	switch st.Type {
+	case unix.CGROUP2_SUPER_MAGIC:
+		// https://www.kernel.org/doc/html/v5.16/admin-guide/cgroup-v2.html#mounting
+		return &cgroupV2{mountPoint, cgroupControllerProber{}, probeUname}, nil
+	case unix.CGROUP_SUPER_MAGIC, unix.TMPFS_MAGIC:
+		// https://git.kernel.org/pub/scm/docs/man-pages/man-pages.git/tree/man7/cgroups.7?h=man-pages-5.13#n159
+		// https://www.kernel.org/doc/html/v5.16/admin-guide/cgroup-v1/cgroups.html#how-do-i-use-cgroups
+		return &cgroupV1{cgroupControllerProber{}}, nil
+	default:
+		msg := fmt.Sprintf("unexpected file system type of %q: 0x%x", mountPoint, st.Type)
+		return nil, cgroupFsDetectionFailed(msg)
+	}
+}
+
+type cgroupFsDetectionFailed string
+
+func (c cgroupFsDetectionFailed) Error() string {
+	return string(c)
+}
+
+func (c cgroupFsDetectionFailed) String() string {
+	return string(c)
+}
+
+func newCgroupSystemProber(probeUname unameProber, mountPoint string) cgroupSystemProber {
+	var once sync.Once
+	var sys cgroupSystem
+	var err error
+
+	return func() (cgroupSystem, error) {
+		once.Do(func() {
+			sys, err = loadCgroupSystem(probeUname, mountPoint)
+		})
+
+		return sys, err
+	}
+}
